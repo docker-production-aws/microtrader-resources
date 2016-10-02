@@ -1,0 +1,11 @@
+- block:
+  - name: S3 Template URL
+    debug: msg={{ cf_s3_template_url }}
+  - name: CloudFormation Cost URL
+    debug: msg={{ cf_cost_estimate_url }}
+    when: cf_calculate_costs | default(false)
+  tags:
+    - generate
+
+  
+  

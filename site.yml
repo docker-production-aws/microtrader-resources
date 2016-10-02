@@ -1,0 +1,4 @@
+- name: Microtrader Resources Deployment Playbook
+  hosts: "{{ env }}"
+  roles:
+    - aws_cloudformation

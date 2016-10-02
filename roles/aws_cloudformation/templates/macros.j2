@@ -1,0 +1,146 @@
+{# Resolves appropriate suffix for various labels #}
+{% macro mapper(values) %}
+[
+{% for value in values %}
+{% if value.credstash is defined %}
+"{{ value.credstash + (stack.credential_store|default({})).provisioning_suffix | default('Provisioner') }}",
+{% elif value.iam is defined %}
+{ "Fn::GetAtt" : [ "{{ value.iam + 'InstanceRole' }}", "Arn" ] },
+{% else %}
+{{ value | to_json }},
+{% endif %}
+{% endfor %}
+]
+{% endmacro %}
+
+{# Returns the name for an AWS::EC2:;SecurityGroupIngress resource #}
+{% macro sg_ingress_name(root, source, rule) %}
+{% if rule.port is defined %}
+{{ (root + source.Ref|default(source) + 'Ingress' + rule.protocol|string|capitalize + rule.port|string) | regex_replace('[^a-zA-Z0-9]*', '') }}
+{% else %}
+{{ (root + source.Ref | default(source) + 'Ingress' + rule.protocol|string|capitalize + rule.from_port|string + 'To' + rule.to_port|string) | regex_replace('[^a-zA-Z0-9]*', '') }}
+{% endif %}
+{% endmacro %}
+
+{# Returns the name for an AWS::EC2:;SecurityGroupEgress resource #}
+{% macro sg_egress_name(root, dest, rule) %}
+{% if rule.port is defined %}
+{{ (root + dest.Ref|default(source) + 'Egress' + rule.protocol|string|capitalize + rule.port|string) | regex_replace('[^a-zA-Z0-9]*', '') }}
+{% else %}
+{{ (root + dest.Ref | default(source) + 'Egress' + rule.protocol|string|capitalize + rule.from_port|string + 'To' + rule.to_port|string) | regex_replace('[^a-zA-Z0-9]*', '') }}
+{% endif %}
+{% endmacro %}
+
+{# Generates an egress security rule to RFC5737 Test address to ensure default block any egress rule #}
+{% macro sg_egress_default(yaml=true) %}
+{% if yaml %}
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "192.0.2.0/32"
+{% else %}
+{ 
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "192.0.2.0/32"
+},
+{% endif %}
+{% endmacro %}
+
+{# Generates default ingress ICMP rules for Yellow internal networks #}
+{% macro sg_ingress_icmp(yaml=true) %}
+{% if yaml %}
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "10.8.0.0/15"
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "10.199.0.0/16"
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "10.30.0.0/16"
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "172.31.4.0/24"
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "172.16.200.0/24"
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "172.16.201.0/24"
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "172.16.212.0/24"
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "172.16.215.0/24"
+- IpProtocol: "icmp"
+  FromPort : -1
+  ToPort : -1
+  CidrIp: "172.16.229.0/24"
+{% else %}
+{ 
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "10.8.0.0/15",
+},
+{
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "10.199.0.0/16",
+},
+{
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "10.30.0.0/16",
+},
+{
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "172.31.4.0/24",
+},
+{
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "172.16.200.0/24",
+},
+{
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "172.16.201.0/24",
+},
+{
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "172.16.212.0/24",
+},
+{
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "172.16.215.0/24",
+},
+{
+  IpProtocol: "icmp",
+  FromPort : -1,
+  ToPort : -1,
+  CidrIp: "172.16.229.0/24",
+},
+{% endif %}
+{% endmacro %}

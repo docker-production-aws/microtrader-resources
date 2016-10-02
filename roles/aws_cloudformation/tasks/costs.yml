@@ -1,0 +1,10 @@
+- block:
+  - name: estimate costs
+    shell: aws cloudformation estimate-template-cost --template-url '{{ cf_s3_result.url }}' {{ stack.inputs | default({}) | to_cost_args }}
+    changed_when: false
+    register: cf_cost_estimate_result
+  - name: set cost URL fact
+    set_fact:
+      cf_cost_estimate_url: "{{ (cf_cost_estimate_result.stdout | from_json).get('Url') }}"
+  tags:
+    - generate

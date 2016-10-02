@@ -1,0 +1,3378 @@
+{# MACROS - BEGIN #}
+{% import 'macros.j2' as func with context %}
+{# MACROS - END #}
+AWSTemplateFormatVersion: "2010-09-09"
+Description: {{ stack.description | default(stack.name) }}
+{% if stack.inputs is defined %}
+Parameters: {{ stack.inputs | to_json }}
+{% endif %}
+Outputs:
+  StackName:
+    Description: "Stack Name"
+    Value: "{{ stack.name }}"
+{% for name, output in (stack.outputs|default({})).items() %}
+  {{ name | regex_replace('[^a-zA-Z0-9]*', '') }}:
+    Description: "{{ output.description }}"
+    Value: {{ output.value | to_json }}
+{% endfor %}
+{% if stack.credential_store is defined %}
+  CredentialStoreMasterKey:
+    Description: "Credential Store Master Key ID"
+    Value: { "Ref": "CredentialStoreMasterKey" }
+{% endif %}
+
+Resources:
+{# SECTION 1 BEGIN - DNS #}
+{% if stack.dns is defined %}
+{% for record_key, record_value in stack.dns.items() %}
+{% if record_value.ptr is defined %}
+  Ptr{{ record_value.ptr | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '') }}:
+{% else %}
+  {{ record_key | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '') }}:
+{% endif %}
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      Name: "{{ record_key }}"
+{% if record_value.alias is defined %}
+      Type: "A"
+      AliasTarget:
+        HostedZoneId: {{ record_value.alias.hosted_zone_id | to_json }}
+        DNSName: {{ record_value.alias.dns_name | to_json }}
+        EvaluateTargetHealth: {{ record_value.alias.evaluate_target_health | default('false') }}
+      HostedZoneName: "{{ record_key | regex_replace('(.*)', '\\1.') }}"
+{% elif record_value.alias_elb is defined %}
+      Type: "A"
+      AliasTarget:
+        HostedZoneId: { "Fn::GetAtt" : ["{{ record_value.alias_elb }}", "CanonicalHostedZoneNameID"] }
+        DNSName: { "Fn::GetAtt" : ["{{ record_value.alias_elb }}", "DNSName"] }
+      HostedZoneName: "{{ record_key | regex_replace('(.*)', '\\1.') }}"
+{% elif record_value.ptr is defined %}
+      HostedZoneName: "{{ record_key | regex_replace('[0-9]*\\.[0-9]*\\.(.*)', '\\1.') }}"
+      Type: "PTR"
+      Comment: "{{ record_value.comment | default('PTR record for ' + record_key) }}"
+      ResourceRecords: [ {{ record_value.ptr | to_json }} ]
+      TTL: "{{ record_value.ttl | default(300) }}"
+{% else %}
+      TTL: "{{ record_value.ttl | default(300) }}"
+      HostedZoneName: "{{ record_value.hosted_zone | default(record_key | regex_replace('[^.]*\\.(.*)', '\\1.')) }}"
+{% if record_value.elb is defined %}
+      Type: "CNAME"
+      Comment: "{{ record_value.comment | default('CNAME record for ' + record_key) }}"
+      ResourceRecords: [ { "Fn::GetAtt": [ "{{ record_value.elb }}", "DNSName" ] } ]
+{% elif record_value.cname is defined %}
+      Type: "CNAME"
+      Comment: "{{ record_value.comment | default('CNAME record for ' + record_key) }}"
+      ResourceRecords: [ {{ record_value.cname | to_json }} ]
+{% elif record_value.rds is defined %}
+      Type: "CNAME"
+      Comment: "{{ record_value.comment | default('CNAME record for ' + record_key) }}"
+      ResourceRecords: [ { "Fn::GetAtt": [ "{{ record_value.rds }}", "Endpoint.Address" ] } ]
+{% elif record_value.elasticsearch is defined %}
+      Type: "CNAME"
+      Comment: "{{ record_value.comment | default('CNAME record for ' + record_key) }}"
+      ResourceRecords: [ { "Fn::GetAtt": [ "{{ record_value.elasticsearch }}", "DomainEndpoint" ] } ]
+{% elif record_value.cloudfront is defined %}
+      Type: "CNAME"
+      Comment: "{{ record_value.comment | default('CNAME record for ' + record_key) }}"
+      ResourceRecords: [ { "Fn::GetAtt": [ "{{ record_value.cloudfront }}", "DomainName" ] } ]
+{% elif record_value.instance_private_ip is defined %}
+      Type: "A"
+      Comment: "{{ record_value.comment | default('A record for ' + record_key) }}"
+      ResourceRecords: [ { "Fn::GetAtt": [ "{{ record_value.instance_private_ip }}", "PrivateIp" ] } ]
+{% elif record_value.instance_public_ip is defined %}
+      Type: "A"
+      Comment: "{{ record_value.comment | default('A record for ' + record_key) }}"
+      ResourceRecords: [ { "Fn::GetAtt": [ "{{ record_value.instance_public_ip }}", "PublicIp" ] } ]
+{% elif record_value.ip is defined %}
+      Type: "A"
+      Comment: "{{ record_value.comment | default('A record for ' + record_key) }}"
+      ResourceRecords: [ {{ record_value.ip | to_json }} ]
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 1 - DNS Zones #}
+{% if stack.zones is defined %}
+{% for zone_name, zone_config in stack.zones.items() %}
+  {{ zone_name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '') }}:
+    Type: "AWS::Route53::HostedZone"
+    Properties:
+      Name: {{ zone_name }}
+{% if zone_config.comment is defined %}
+      HostedZoneConfig:
+        Comment: "{{ zone_config.comment }}"
+{% endif %}
+{% if zone_config.tags is defined %}
+      HostedZoneTags:
+{% for key, value in zone_config.tags.items() %}
+        - Key: "{{ key }}"
+          Value: "{{ value }}"
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 1 END - DNS #}
+{# SECTION 2.1 BEGIN - Application Load Balancer #}
+{% if stack.alb is defined %}
+{% for alb_name, alb_config in stack.alb.items() %}
+{% if alb_config.create | default(True) %}
+  {{ alb_config.security_group_name | default(alb_name + 'SG') }}:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "{{ alb_config.description | default(stack.name + '-' + alb_name + '-sg') }}"
+      VpcId: "{{ stack.vpc_id }}"
+      SecurityGroupIngress: [
+{% for rule in alb_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source | ipaddr %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{rule.to_port | default(rule.port) }}",
+          CidrIp: "{{ source }}"
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+{{ func.sg_ingress_icmp(yaml=false) | indent(8, True) }}
+      ]
+      SecurityGroupEgress: [
+{% if alb_config.egress_security_rules is not defined %}
+{{ func.sg_egress_default(yaml=false) | indent(8, True) }}
+{% else %}
+{% for rule in alb_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest | ipaddr %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{rule.to_port | default(rule.port) }}",
+          CidrIp: "{{ dest }}"
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% endif %}
+      ]
+      Tags:
+        - Key: "Name"
+          Value: "{{ stack.name + '-' + alb_config.security_group_name | default(alb_name + '-sg') }}"
+{% for rule in alb_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if not source | ipaddr %}
+  {{ func.sg_ingress_name(alb_name, source, rule) }}:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{ rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ alb_config.security_group_name | default(alb_name + 'SG') }}" }
+      SourceSecurityGroupId: {{ source | to_json }}
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% for rule in alb_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if not dest | ipaddr %}
+  {{ func.sg_egress_name(alb_name, dest, rule) }}:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ alb_config.security_group_name | default(alb_name + 'SG') }}" }
+      DestinationSecurityGroupId: {{ dest | to_json }}
+{% endif %}
+{% endfor %}
+{% endfor %}
+  {{ alb_name }}:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Scheme: "{{ alb_config.scheme | default('internet-facing') }}"
+      SecurityGroups:
+       - { "Ref": "{{ alb_config.security_group_name | default(alb_name + 'SG') }}" }
+{% for group in alb_config.additional_security_groups | default([]) %}
+       - {{ group | to_json }}
+{% endfor %}
+      Subnets: {{ alb_config.subnet_ids | to_json }}
+      LoadBalancerAttributes: {{ alb_config.attributes | default([]) | to_json }}
+      Tags: [
+          { Key: "Name", Value: "{{ stack.name }}-{{ alb_name }}" },
+{% for tag_name, tag_value in (alb_config.tags|default({})).items() %}
+          { Key: "{{ tag_name }}", Value: "{{ tag_value }}" },
+{% endfor %}
+      ]
+{% if alb_config.listeners is defined %}
+{% for listener_name, listener_config in alb_config.listeners.items() %}
+  {{ listener_name }}:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: {{ listener_config.default_target_group | to_json }}
+          Type: forward
+      LoadBalancerArn: { "Ref": "{{ alb_name }}" }
+      Port: "{{ listener_config.port }}"
+      Protocol: "{{ listener_config.protocol | upper }}"
+      Certificates: {{ listener_config.certificates | default([]) | to_json }}
+{% if listener_config.ssl_policy is defined %}
+      SslPolicy: "{{ listener_config.ssl_config }}"
+{% endif %}
+{% if listener_config.rules is defined %}
+{% for rule_name, rule_config in listener_config.rules.items() %}
+  {{ rule_name }}:
+    Type: "AWS::ElasticLoadBalancingV2::ListenerRule"
+    Properties:
+      Actions:
+          - TargetGroupArn: {{ rule_config.target_group | to_json }}
+            Type: forward
+      Conditions: {{ rule_config.conditions | to_json }}
+      ListenerArn: { "Ref": "{{ listener_name }}" }
+      Priority: "{{ rule_config.priority }}"
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if alb_config.target_groups is defined %}
+{% for group_name, group_config in alb_config.target_groups.items() %}
+  {{ group_name }}:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties: {{ group_config | to_json }}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 2 BEGIN - Elastic Load Balancer #}
+{% if stack.elb is defined %}
+{% for elb_name, elb_config in stack.elb.items() %}
+{% if elb_config.create | default(True) %}
+  {{ elb_name + 'SG' }}:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "{{ stack.name }}-{{ elb_name }}-sg"
+      VpcId: "{{ stack.vpc_id }}"
+      SecurityGroupEgress: [
+{% for listener in elb_config.listeners %}
+{% if listener.create | default(true) %}
+{% for allowed_destination in listener.allowed_destinations %}
+{% if allowed_destination.sg is not defined %}
+        {
+          IpProtocol: "{{ listener.ip_protocol }}",
+          FromPort: "{{ listener.back_end }}",
+          ToPort: "{{ listener.back_end }}",
+{% if allowed_destination | ipaddr %}
+          CidrIp: "{{ allowed_destination }}",
+{% else %}
+          DestinationSecurityGroupId: {{ allowed_destination | to_json }}
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+      ]
+      SecurityGroupIngress:
+{% for listener in elb_config.listeners %}
+{% if listener.create | default(true) %}
+{% for allowed_source in listener.allowed_sources | default([]) %}
+{% if allowed_source.sg is not defined %}
+        - IpProtocol: "{{ listener.ip_protocol }}"
+          FromPort: "{{ listener.front_end }}"
+          ToPort: "{{ listener.front_end }}"
+{% if allowed_source | ipaddr %}
+          CidrIp: "{{ allowed_source }}"
+{% else %}
+          SourceSecurityGroupId: {{ allowed_source | to_json }}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "10.8.0.0/15"
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "10.199.0.0/16"
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "10.30.0.0/16"
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "172.31.4.0/24"
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "172.16.200.0/24"
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "172.16.201.0/24"
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "172.16.212.0/24"
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "172.16.215.0/24"
+        - IpProtocol: "icmp"
+          FromPort : -1
+          ToPort : -1
+          CidrIp: "172.16.229.0/24"
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ elb_name }}-sg" }
+{% for listener in elb_config.listeners %}
+{% if listener.create | default(true) %}
+{% for allowed_destination in listener.allowed_destinations %}
+{% if allowed_destination.sg is defined %}
+  {{ (elb_name + 'SG' + allowed_destination.sg + 'SecurityGroupEgress' + listener.ip_protocol|string|capitalize + listener.back_end | string) | regex_replace('[^a-zA-Z0-9]*', '') }}:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      IpProtocol: "{{ listener.ip_protocol }}"
+      FromPort: "{{ listener.back_end }}"
+      ToPort: "{{ listener.back_end }}"
+      GroupId: { "Ref": "{{ elb_name + 'SG' }}" }
+      DestinationSecurityGroupId: { "Ref": "{{ allowed_destination.sg }}" }
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% for listener in elb_config.listeners %}
+{% if listener.create | default(true) %}
+{% for allowed_source in listener.allowed_sources %}
+{% if allowed_source.sg is defined %}
+  {{ (elb_name + 'SG' + allowed_source.sg + 'SecurityGroupIngress' + listener.ip_protocol|string|capitalize + listener.front_end | string) | regex_replace('[^a-zA-Z0-9]*', '') }}:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: "{{ listener.ip_protocol }}"
+      FromPort: "{{ listener.front_end }}"
+      ToPort: "{{ listener.front_end }}"
+      GroupId: { "Ref": "{{ elb_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ allowed_source.sg }}" }
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+  {{ elb_name }}:
+    Type : "AWS::ElasticLoadBalancing::LoadBalancer"
+    Properties:
+      Scheme: "{{ elb_config.scheme | default('internet-facing') }}"
+      SecurityGroups:
+       - { "Ref": "{{ elb_name + 'SG' }}" }
+      Subnets: [ "{{ elb_config.subnet_ids | join('\",\"') }}" ]
+      CrossZone: "true"
+      ConnectionDrainingPolicy:
+        Enabled: "true"
+        Timeout: 300
+      Listeners:
+{% for listener in elb_config.listeners %}
+{% if listener.create | default(true) %}
+        - LoadBalancerPort: "{{ listener.front_end }}"
+          InstancePort: "{{ listener.back_end }}"
+{% if listener.instance_protocol is defined %}
+          InstanceProtocol: "{{ listener.instance_protocol }}"
+{% endif %}
+          Protocol: "{{ listener.protocol | default('tcp') }}"
+{% if listener.certificate_id is defined %}
+          SSLCertificateId: "{{ listener.certificate_id }}"
+{% endif %}
+{% endif %}
+{% endfor %}
+      Instances: [
+{% for instance in elb_config.instances | default([]) %}
+        {{ instance | to_json }},
+{% endfor %}
+      ]
+{% if elb_config.health_check is defined %}
+      HealthCheck:
+        Target: "{{ elb_config.health_check }}"
+        HealthyThreshold: "2"
+        UnhealthyThreshold: "10"
+        Interval: "30"
+        Timeout: "5"
+{% endif %}
+      Tags: [
+          { Key: "Name", Value: "{{ stack.name }}-{{ elb_name }}" },
+{% for tag_name, tag_value in (elb_config.tags|default({})).items() %}
+          { Key: "{{ tag_name }}", Value: "{{ tag_value }}" },
+{% endfor %}
+        ]
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 2 END - Elastic Load Balancer #}
+{# SECTION 3 BEGIN - Security Groups #}
+{% if stack.ec2 is defined %}
+{% for sg_name, sg_config in (stack.ec2.security_groups|default({})).items() %}
+  {{ sg_name }}:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "{{ sg_config.description | default(sg_name + ' Security Group') }}"
+      VpcId: {{ stack.vpc_id | to_json }}
+      SecurityGroupIngress: [
+{% for rule in sg_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{rule.to_port | default(rule.port) }}",
+{% if source | ipaddr %}
+          CidrIp: "{{ source }}"
+{% else %}
+          SourceSecurityGroupId: {{ source | to_json }}
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      SecurityGroupEgress: [
+{% for rule in sg_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{rule.to_port | default(rule.port) }}",
+{% if dest | ipaddr %}
+          CidrIp: "{{ dest }}"
+{% else %}
+          DestinationSecurityGroupId: {{ dest | to_json }}
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      Tags: [
+{% for tag in sg_config.tags | default([]) %}
+        {{ tag | to_json }},
+{% endfor %}
+      ]
+{% for rule in sg_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is defined %}
+  {{ (sg_name + source.sg + 'SecurityGroupIngress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '') }}:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ sg_name }}" }
+      SourceSecurityGroupId: { "Ref": "{{ source.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% for rule in sg_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is defined %}
+  {{ (sg_name + dest.sg + 'SecurityGroupEgress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ sg_name }}" }
+      SourceSecurityGroupId: { "Ref": "{{ dest.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{# SECTION 3 END - Security Groups #}
+{# SECTION 4 BEGIN - Autoscaling #}
+{% if (stack.ec2|default({})).autoscaling is defined %}
+{% for asg_name, asg_config in stack.ec2.autoscaling.items() %}
+{% if asg_config.create | default(True) %}
+{% if asg_config.ecs_cluster is defined %}
+{% if stack.logs is defined %}
+  {{ asg_name + 'LogGroupDmesg' }}:
+    Type: "Custom::LogGroup"
+{% if asg_config.log_subscription is defined %}
+    DependsOn:
+      - "{{ asg_config.log_subscription.DestinationArn.get("Fn::GetAtt")[0] + 'CollectorPermission' }}"
+{% endif %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + asg_name + '/var/log/dmesg' }}"
+      Retention: "{{ asg_config.log_retention | default(30) }}"
+      Destroy: "{{ asg_config.log_destroy | default('false') }}"
+{% if asg_config.log_subscription is defined %}
+      Subscription: {{ asg_config.log_subscription | to_json }}
+{% endif %}
+  {{ asg_name + 'LogGroupDocker' }}:
+    Type: "Custom::LogGroup"
+{% if asg_config.log_subscription is defined %}
+    DependsOn:
+      - "{{ asg_config.log_subscription.DestinationArn.get("Fn::GetAtt")[0] + 'CollectorPermission' }}"
+{% endif %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + asg_name + '/var/log/docker' }}"
+      Retention: "{{ asg_config.log_retention | default(30) }}"
+      Destroy: "{{ asg_config.log_destroy | default('false') }}"
+{% if asg_config.log_subscription is defined %}
+      Subscription: {{ asg_config.log_subscription | to_json }}
+{% endif %}
+  {{ asg_name + 'LogGroupMessages' }}:
+    Type: "Custom::LogGroup"
+{% if asg_config.log_subscription is defined %}
+    DependsOn:
+      - "{{ asg_config.log_subscription.DestinationArn.get("Fn::GetAtt")[0] + 'CollectorPermission' }}"
+{% endif %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + asg_name + '/var/log/messages' }}"
+      Retention: "{{ asg_config.log_retention | default(30) }}"
+      Destroy: "{{ asg_config.log_destroy | default('false') }}"
+{% if asg_config.log_subscription is defined %}
+      Subscription: {{ asg_config.log_subscription | to_json }}
+{% endif %}
+  {{ asg_name + 'LogGroupEcsAgent' }}:
+    Type: "Custom::LogGroup"
+{% if asg_config.log_subscription is defined %}
+    DependsOn:
+      - "{{ asg_config.log_subscription.DestinationArn.get("Fn::GetAtt")[0] + 'CollectorPermission' }}"
+{% endif %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + asg_name + '/var/log/ecs-agent' }}"
+      Retention: "{{ asg_config.log_retention | default(30) }}"
+      Destroy: "{{ asg_config.log_destroy | default('false') }}"
+{% if asg_config.log_subscription is defined %}
+      Subscription: {{ asg_config.log_subscription | to_json }}
+{% endif %}
+  {{ asg_name + 'LogGroupEcsInit' }}:
+    Type: "Custom::LogGroup"
+{% if asg_config.log_subscription is defined %}
+    DependsOn:
+      - "{{ asg_config.log_subscription.DestinationArn.get("Fn::GetAtt")[0] + 'CollectorPermission' }}"
+{% endif %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + asg_name + '/var/log/ecs-init' }}"
+      Retention: "{{ asg_config.log_retention | default(30) }}"
+      Destroy: "{{ asg_config.log_destroy | default('false') }}"
+{% if asg_config.log_subscription is defined %}
+      Subscription: {{ asg_config.log_subscription | to_json }}
+{% endif %}
+{% for log_group_name, log_group_value in (asg_config.log_groups | default({})).items() %}
+  {{ asg_name + log_group_name }}:
+    Type: "Custom::LogGroup"
+{% if asg_config.log_subscription is defined %}
+    DependsOn:
+      - "{{ asg_config.log_subscription.DestinationArn.get("Fn::GetAtt")[0] + 'CollectorPermission' }}"
+{% endif %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ log_group_value }}"
+      Retention: "{{ asg_config.log_retention | default(30) }}"
+      Destroy: "{{ asg_config.log_destroy | default('false') }}"
+{% if asg_config.log_subscription is defined %}
+      Subscription: {{ asg_config.log_subscription | to_json }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+  {{ asg_name + 'LaunchConfiguration' }}:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+{% if asg_config.metadata is defined %}
+    Metadata: {{ asg_config.metadata | to_json }}
+{% elif asg_config.cfn_init is defined %}
+    Metadata:
+      "AWS::CloudFormation::Init":
+        config:
+          "commands": {
+{% for cmd_name, cmd_config in asg_config.cfn_init.commands | default({}) | dictsort %}
+            "{{ cmd_name }}": {
+{% if cmd_config.bash is defined %}
+              "command": { "Fn::Join" : ["", [
+{% for line in cmd_config.bash %}
+                {{ line | to_json }},
+{% endfor %}
+              ] ] },
+{% else %}
+              "command": "{{ cmd_config.command }}",
+{% endif %}
+{% if cmd_config.env is defined %}
+              "env" : {{ cmd_config.env | to_json }},
+{% endif %}
+{% if cmd_config.cwd is defined %}
+              "cwd" : "{{ cmd_config.cwd }}",
+{% endif %}
+{% if cmd_config.test is defined %}
+              "test" : "{{ cmd_config.test }}",
+{% endif %}
+{% if cmd_config.ignoreErrors is defined %}
+              "ignoreErrors" : "{{ cmd_config.ignoreErrors }}"
+{% endif %}
+            },
+{% endfor %}
+          }
+          "files": {
+{% for file_name, file_config in asg_config.cfn_init.files | default({}) | dictsort %}
+            "{{ file_name }}": {{ file_config | to_json }},
+{% endfor %}
+          }
+          "groups": {{ asg_config.cfn_init.groups | default({}) | to_json }}
+          "users": {{ asg_config.cfn_init.users | default({}) | to_json }}
+          "packages": {{ asg_config.cfn_init.packages | default({}) | to_json }}
+          "services": {{ asg_config.cfn_init.services | default({}) | to_json }}
+          "sources": {{ asg_config.cfn_init.sources | default({}) | to_json }}
+{% endif %}
+    Properties:
+{% if asg_config.ami is defined %}
+      ImageId: "{{ asg_config.ami }}"
+{% elif asg_config.ami_label is defined %}
+      ImageId: { "Fn::FindInMap": [ "AmiMappings", { "Ref": "AWS::Region" }, "{{ asg_config.ami_label }}" ] }
+{% endif %}
+      InstanceType: "{{ asg_config.instance_type }}"
+{% if asg_config.associate_public_ip is defined %}
+      AssociatePublicIpAddress: "{{ asg_config.associate_public_ip }}"
+{% endif %}
+{% if asg_config.block_device_mappings is defined %}
+      BlockDeviceMappings:
+{% for device in asg_config.block_device_mappings %}
+            - DeviceName: {{ device.DeviceName }}
+              Ebs:
+                VolumeSize: {{ device.VolumeSize|default(100) }}
+                VolumeType: {{ device.VolumeType|default('gp2') }}
+                DeleteOnTermination: {{ device.DeleteOnTermination|default(True) }}
+{% if device.iops is defined %}
+                Iops: {{ device.iops }}
+{% endif %}
+{% endfor %}
+{% endif %}
+      IamInstanceProfile: { "Ref": "{{ asg_name + 'InstanceProfile' }}" }
+      KeyName: "{{ asg_config.key_name }}"
+      SecurityGroups:
+{% if asg_config.security_groups is defined %}
+{% for group in asg_config.security_groups %}
+        - {{ group | to_json }}
+{% endfor %}
+{% else %}
+        - { "Ref" : "{{ asg_name + 'SG' }}" }
+{% if asg_config.additional_security_groups is defined %}
+{% for group in asg_config.additional_security_groups %}
+        - {{ group | to_json }}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% if asg_config.cfn_init is defined %}
+      UserData: {
+        "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash\n",
+{% for line in asg_config.early_userdata | default([]) %}
+          {{ line | to_json }},
+{% endfor %}
+{% if asg_config.cfn_init.install_tools | default(false) %}
+          "yum install -y aws-cfn-bootstrap\n",
+{% endif %}
+          "/opt/aws/bin/cfn-init -v ",
+          "         --stack ", { "Ref" : "AWS::StackName" },
+          "         --resource {{ asg_name + 'LaunchConfiguration' }} ",
+          "         --region ", { "Ref" : "AWS::Region" },
+{% if asg_config.cfn_init.proxy is defined %}
+          "         --http-proxy {{ asg_config.cfn_init.proxy }} ",
+          "         --https-proxy {{ asg_config.cfn_init.proxy }} ",
+{% endif %}
+          "\n",
+          "/opt/aws/bin/cfn-signal -e $? --stack ", { "Ref" : "AWS::StackName" },
+          "         --resource {{ asg_name }} ",
+          "         --region ", { "Ref" : "AWS::Region" },
+{% if asg_config.cfn_init.proxy is defined %}
+          "         --http-proxy {{ asg_config.cfn_init.proxy }} ",
+          "         --https-proxy {{ asg_config.cfn_init.proxy }} ",
+{% endif %}
+          "\n",
+{% for line in asg_config.userdata | default([]) %}
+          {{ line | to_json }},
+{% endfor %}
+        ] ] }
+      }
+{% elif asg_config.ecs_cluster is defined %}
+      UserData: {
+        "Fn::Base64" : { "Fn::Join" : ["", [
+{% if asg_config.userdata is defined %}
+{% for line in asg_config.userdata %}
+          {{ line | to_json }},
+{% endfor %}
+{% else %}
+          "#!/bin/bash\n",
+          "echo ECS_CLUSTER=", {{ asg_config.ecs_cluster | to_json }}, " >> /etc/ecs/ecs.config\n",
+{% endif %}
+        ] ] }
+      }
+{% elif asg_config.userdata is defined %}
+      UserData: {
+        "Fn::Base64" : { "Fn::Join" : ["", [
+{% for line in asg_config.userdata %}
+          {{ line | to_json }},
+{% endfor %}
+        ] ] }
+      }
+{% endif %}
+  {{ asg_name }}:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    DependsOn: {{ asg_config.depends_on | default([]) | to_json }}
+{% if asg_config.rolling_updates | default(True) %}
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: "{{ asg_config.min_instances_in_service | default(1) }}"
+        MinSuccessfulInstancesPercent: "{{ asg_config.min_successful_instances_percent | default(100) }}"
+{% if asg_config.desired_size > 0 %}
+        WaitOnResourceSignals: "true"
+{% else %}
+        WaitOnResourceSignals: "false"
+{% endif %}
+        PauseTime: "PT15M"
+{% endif %}
+{% if asg_config.cfn_init is defined %}
+    CreationPolicy:
+      ResourceSignal:
+        Count: "{{ asg_config.desired_size }}"
+        Timeout: "PT{{ asg_config.cfn_init.timeout | default(5) }}M"
+{% endif %}
+    Properties:
+      VPCZoneIdentifier: [ "{{ asg_config.subnet_ids | join('\",\"') }}" ]
+      LaunchConfigurationName: { "Ref" : "{{ asg_name + 'LaunchConfiguration' }}" }
+      MinSize: "{{ asg_config.min_size | default(0) }}"
+      MaxSize: "{{ asg_config.max_size | default(4) }}"
+      DesiredCapacity: "{{ asg_config.desired_size | default(1) }}"
+      LoadBalancerNames: [
+{% for elb in asg_config.load_balancers | default([]) %}
+        {{ elb | to_json }},
+{% endfor %}
+      ]
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ asg_name }}-instance", PropagateAtLaunch: "true" }
+{% for tag_name, tag_value in (asg_config.tags|default({})).items() %}
+        - { Key: "{{ tag_name }}", Value: "{{ tag_value }}", PropagateAtLaunch: "true" }
+{% endfor %}
+{% if asg_config.security_groups is not defined %}
+  {{ asg_name + 'SG' }}:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "{{ stack.name }}-{{ asg_name }}-sg"
+      VpcId: "{{ stack.vpc_id }}"
+      SecurityGroupEgress: [
+{% for rule in asg_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{ rule.to_port | default(rule.port) }}",
+{% if dest | ipaddr %}
+          CidrIp: "{{ dest }}"
+{% else %}
+          DestinationSecurityGroupId: {{ dest | to_json }}
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      SecurityGroupIngress: [
+{% for rule in asg_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{rule.to_port | default(rule.port) }}",
+{% if source | ipaddr %}
+          CidrIp: "{{ source }}",
+{% else %}
+          SourceSecurityGroupId: {{ source | to_json }},
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ asg_name }}-sg" }
+{% for rule in asg_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is defined %}
+  {{ (asg_name + 'SG' + source.sg + 'SecurityGroupIngress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ asg_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ source.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% for rule in asg_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is defined %}
+  {{ (asg_name + 'SG' + dest.sg + 'SecurityGroupEgress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ asg_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ dest.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% endif %}
+  {{ asg_name + 'InstanceRole' }}:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: [ "ec2.amazonaws.com" ]
+            Action: [ "sts:AssumeRole" ]
+      Path: "/"
+      ManagedPolicyArns: [
+{% for policy in asg_config.managed_policies | default([]) %}
+        {{ policy | to_json | indent(8, False) }},
+{% endfor %}
+      ]
+      Policies: [
+{% if asg_config.ecs_cluster is defined %}
+        {
+          "PolicyName": "EC2InstancePolicy",
+          "PolicyDocument": {
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ecs:RegisterContainerInstance",
+                  "ecs:DeregisterContainerInstance"
+                ],
+                "Resource": { "Fn::Join" :
+                  ["",
+                    [
+                      "arn:aws:ecs:",
+                      { "Ref" : "AWS::Region" }, ":",
+                      { "Ref": "AWS::AccountId" },
+                      ":cluster/",
+                      {{ asg_config.ecs_cluster | to_json }}
+                    ]
+                  ]
+                }
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ecs:DiscoverPollEndpoint",
+                  "ecs:Submit*",
+                  "ecs:Poll",
+                  "ecs:StartTelemetrySession"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+        },
+{% endif %}
+{% if stack.credential_store is defined %}
+        {
+          "PolicyName": "credential-store",
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "ReadOnlyAccessToCredentialStore",
+                "Effect": "Allow",
+                "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:BatchGetItem",
+                    "dynamodb:Scan",
+                    "dynamodb:Query"
+                ],
+                "Resource": [
+{% for table_name in stack.credential_store.tables.keys() %}
+                  { "Fn::Join" :
+                    ["",
+                      [
+                        "arn:aws:dynamodb:",
+                        { "Ref" : "AWS::Region" }, ":",
+                        { "Ref" : "AWS::AccountId" },
+                        ":table/",
+                        { "Ref": "{{ table_name }}" }
+                      ]
+                    ]
+                  },
+{% endfor %}
+                ]
+              }
+            ]
+          }
+        },
+{% endif %}
+{% if asg_config.inline_policies is defined %}
+{% for policy in asg_config.inline_policies %}
+        {{ policy | to_json | indent(8, False) }},
+{% endfor %}
+{% endif %}
+        {{ cf_cloudwatch_ec2_logs_policy | to_json }}
+      ]
+  {{ asg_name + 'InstanceProfile' }}:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+{% if asg_config.role is defined %}
+        - {{ asg_config.role | to_json }}
+{% else %}
+        - { "Ref": "{{ asg_name + 'InstanceRole' }}" }
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 4 END - Autoscaling #}
+{# SECTION 5 BEGIN - EC2 #}
+{% if (stack.ec2|default({})).instances is defined %}
+{% for ec2_name, ec2_config in stack.ec2.instances.items() %}
+{% if ec2_config.ecs_cluster is defined and stack.logs is defined %}
+  {{ ec2_name + 'LogGroupDmesg' }}:
+    Type: "Custom::LogGroup"
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + ec2_name + '/var/log/dmesg' }}"
+      Retention: "{{ ec2_config.log_retention | default(30) }}"
+      Destroy: "{{ ec2_config.log_destroy | default('false') }}"
+{% if ec2_config.log_subscription is defined %}
+      Subscription: {{ ec2_config.log_subscription | to_json }}
+{% endif %}
+  {{ ec2_name + 'LogGroupDocker' }}:
+    Type: "Custom::LogGroup"
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + ec2_name + '/var/log/docker' }}"
+      Retention: "{{ ec2_config.log_retention | default(30) }}"
+      Destroy: "{{ ec2_config.log_destroy | default('false') }}"
+{% if ec2_config.log_subscription is defined %}
+      Subscription: {{ ec2_config.log_subscription | to_json }}
+{% endif %}
+  {{ ec2_name + 'LogGroupMessages' }}:
+    Type: "Custom::LogGroup"
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + ec2_name + '/var/log/messages' }}"
+      Retention: "{{ ec2_config.log_retention | default(30) }}"
+      Destroy: "{{ ec2_config.log_destroy | default('false') }}"
+{% if ec2_config.log_subscription is defined %}
+      Subscription: {{ ec2_config.log_subscription | to_json }}
+{% endif %}
+  {{ ec2_name + 'LogGroupEcsAgent' }}:
+    Type: "Custom::LogGroup"
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + ec2_name + '/var/log/ecs-agent' }}"
+      Retention: "{{ ec2_config.log_retention | default(30) }}"
+      Destroy: "{{ ec2_config.log_destroy | default('false') }}"
+{% if ec2_config.log_subscription is defined %}
+      Subscription: {{ ec2_config.log_subscription | to_json }}
+{% endif %}
+  {{ ec2_name + 'LogGroupEcsInit' }}:
+    Type: "Custom::LogGroup"
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ stack.name + '/EC2/' + ec2_name + '/var/log/ecs-init' }}"
+      Retention: "{{ ec2_config.log_retention | default(30) }}"
+      Destroy: "{{ ec2_config.log_destroy | default('false') }}"
+{% if ec2_config.log_subscription is defined %}
+      Subscription: {{ ec2_config.log_subscription | to_json }}
+{% endif %}
+{% for log_group_name, log_group_value in (ec2_config.log_groups | default({})).items() %}
+  {{ ec2_name + log_group_name }}:
+    Type: "Custom::LogGroup"
+{% if ec2_config.log_subscription is defined %}
+    DependsOn:
+      - "{{ ec2_config.log_subscription.DestinationArn.get("Fn::GetAtt")[0] + 'CollectorPermission' }}"
+{% endif %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ log_group_value }}"
+      Retention: "{{ ec2_config.log_retention | default(30) }}"
+      Destroy: "{{ ec2_config.log_destroy | default('false') }}"
+{% if ec2_config.log_subscription is defined %}
+      Subscription: {{ ec2_config.log_subscription | to_json }}
+{% endif %}
+{% endfor %}
+{% endif %}
+  {{ ec2_name }}:
+    Type: "AWS::EC2::Instance"
+    DependsOn: {{ ec2_config.depends_on | default([]) | to_json }}
+{% if ec2_config.metadata is defined %}
+    Metadata: {{ ec2_config.metadata | to_json }}
+{% elif ec2_config.cfn_init is defined %}
+    CreationPolicy:
+      ResourceSignal:
+        Count: "1"
+        Timeout: "PT{{ ec2_config.cfn_init.timeout | default(5) }}M"
+    Metadata:
+      "AWS::CloudFormation::Init":
+        config:
+          "commands": {
+{% for cmd_name, cmd_config in ec2_config.cfn_init.commands | default({}) | dictsort %}
+            "{{ cmd_name }}": {
+{% if cmd_config.bash is defined %}
+              "command": { "Fn::Join" : ["", [
+{% for line in cmd_config.bash %}
+                {{ line | to_json }},
+{% endfor %}
+              ] ] },
+{% else %}
+              "command": "{{ cmd_config.command }}",
+{% endif %}
+{% if cmd_config.env is defined %}
+              "env" : {{ cmd_config.env | to_json }},
+{% endif %}
+{% if cmd_config.cwd is defined %}
+              "cwd" : "{{ cmd_config.cwd }}",
+{% endif %}
+{% if cmd_config.test is defined %}
+              "test" : "{{ cmd_config.test }}",
+{% endif %}
+{% if cmd_config.ignoreErrors is defined %}
+              "ignoreErrors" : "{{ cmd_config.ignoreErrors }}"
+{% endif %}
+            },
+{% endfor %}
+          }
+          "files": {
+{% for file_name, file_config in ec2_config.cfn_init.files | default({}) | dictsort %}
+            "{{ file_name }}": {{ file_config | to_json }},
+{% endfor %}
+          }
+          "groups": {{ ec2_config.cfn_init.groups | default({}) | to_json }}
+          "users": {{ ec2_config.cfn_init.users | default({}) | to_json }}
+          "packages": {{ ec2_config.cfn_init.packages | default({}) | to_json }}
+          "services": {{ ec2_config.cfn_init.services | default({}) | to_json }}
+          "sources": {{ ec2_config.cfn_init.sources | default({}) | to_json }}
+{% endif %}
+    Properties:
+{% if ec2_config.ami is defined %}
+      ImageId: "{{ ec2_config.ami }}"
+{% elif ec2_config.ami_label is defined %}
+      ImageId: { "Fn::FindInMap": [ "AmiMappings", { "Ref": "AWS::Region" }, "{{ ec2_config.ami_label }}" ] }
+{% endif %}
+      InstanceType: "{{ ec2_config.instance_type | default('t2.micro') }}"
+      KeyName: "{{ ec2_config.key_name }}"
+      SubnetId: "{{ ec2_config.subnet_id }}"
+{% if ec2_config.private_ip_address is defined %}
+      PrivateIpAddress: "{{ ec2_config.private_ip_address }}"
+{% endif %}
+{% if ec2_config.block_device_mappings is defined %}
+      BlockDeviceMappings:
+{% for device in ec2_config.block_device_mappings %}
+            - DeviceName: {{ device.DeviceName }}
+              Ebs:
+                VolumeSize: {{ device.VolumeSize|default(100) }}
+                VolumeType: {{ device.VolumeType|default('gp2') }}
+                DeleteOnTermination: {{ device.DeleteOnTermination|default(True) }}
+{% if device.iops is defined %}
+                Iops: {{ device.iops }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if ec2_config.volumes is defined %}
+      Volumes:
+{% for volume in ec2_config.volumes %}
+         VolumeId: { "Ref": "{{ volume.VolumeId }}" }
+         Device: "{{ volume.Device|default('/dev/sdh') }}"
+{% endfor %}
+{% endif %}
+      IamInstanceProfile: { "Ref": "{{ ec2_name + 'InstanceProfile' }}" }
+      Monitoring: "{{ ec2_config.monitoring | default('false') }}"
+      SecurityGroupIds:
+{% if ec2_config.security_groups is defined %}
+{% for group in ec2_config.security_groups %}
+        - {{ group | to_json }}
+{% endfor %}
+{% else %}
+        - { "Ref" : "{{ ec2_name + 'SG' }}" }
+{% endif %}
+{% if ec2_config.cfn_init is defined %}
+      UserData: {
+        "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash\n",
+{% for line in ec2_config.early_userdata | default([]) %}
+          {{ line | to_json }},
+{% endfor %}
+{% if ec2_config.cfn_init.install_tools | default(false) %}
+          "yum install -y aws-cfn-bootstrap\n",
+{% endif %}
+          "/opt/aws/bin/cfn-init -v ",
+          "         --stack ", { "Ref" : "AWS::StackName" },
+          "         --resource {{ ec2_name }} ",
+          "         --region ", { "Ref" : "AWS::Region" },
+{% if ec2_config.cfn_init.proxy is defined %}
+          "         --http-proxy {{ ec2_config.cfn_init.proxy }} ",
+          "         --https-proxy {{ ec2_config.cfn_init.proxy }} ",
+{% endif %}
+          "\n",
+          "/opt/aws/bin/cfn-signal -e $? --stack ", { "Ref" : "AWS::StackName" },
+          "         --resource {{ ec2_name }} ",
+          "         --region ", { "Ref" : "AWS::Region" },
+{% if ec2_config.cfn_init.proxy is defined %}
+          "         --http-proxy {{ ec2_config.cfn_init.proxy }} ",
+          "         --https-proxy {{ ec2_config.cfn_init.proxy }} ",
+{% endif %}
+          "\n",
+{% for line in ec2_config.userdata | default([]) %}
+          {{ line | to_json }},
+{% endfor %}
+        ] ] }
+      }
+{% elif ec2_config.ecs_cluster is defined %}
+      UserData: {
+        "Fn::Base64" : { "Fn::Join" : ["", [
+{% if ec2_config.userdata is defined %}
+{% for line in ec2_config.userdata %}
+          {{ line | to_json }},
+{% endfor %}
+{% else %}
+          "#!/bin/bash\n",
+          "echo ECS_CLUSTER=", {{ ec2_config.ecs_cluster | to_json }}, " >> /etc/ecs/ecs.config\n",
+{% endif %}
+        ] ] }
+      }
+{% elif ec2_config.userdata is defined %}
+      UserData: {
+        "Fn::Base64" : { "Fn::Join" : ["", [
+{% for line in ec2_config.userdata %}
+          {{ line | to_json }},
+{% endfor %}
+        ] ] }
+      }
+{% endif %}
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ ec2_name }}" }
+{% for tag_name, tag_value in (ec2_config.tags|default({})).items() %}
+        - { Key: "{{ tag_name }}", Value: "{{ tag_value }}" }
+{% endfor %}
+{% if ec2_config.security_groups is not defined %}
+  {{ ec2_name + 'SG' }}:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "{{ stack.name }}-{{ ec2_name }}-sg"
+      VpcId: "{{ stack.vpc_id }}"
+      SecurityGroupEgress: [
+{% for rule in ec2_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{ rule.to_port | default(rule.port) }}",
+{% if dest | ipaddr %}
+          CidrIp: "{{ dest }}",
+{% else %}
+          DestinationSecurityGroupId: {{ dest | to_json }}
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      SecurityGroupIngress: [
+{% for rule in ec2_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{rule.to_port | default(rule.port) }}",
+{% if source | ipaddr %}
+          CidrIp: "{{ source }}",
+{% else %}
+          SourceSecurityGroupId: {{ source | to_json }},
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ ec2_name }}-sg" }
+{% for rule in ec2_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is defined %}
+  {{ (ec2_name + 'SG' + source.sg + 'SecurityGroupIngress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ ec2_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ source.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% for rule in ec2_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is defined %}
+  {{ (ec2_name + 'SG' + dest.sg + 'SecurityGroupEgress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ ec2_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ dest.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% endif %}
+  {{ ec2_name + 'InstanceRole' }}:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: [ "ec2.amazonaws.com" ]
+            Action: [ "sts:AssumeRole" ]
+      Path: "/"
+      ManagedPolicyArns: [
+{% for policy in ec2_config.managed_policies | default([]) %}
+        {{ policy | to_json | indent(8, False) }},
+{% endfor %}
+      ]
+      Policies: [
+{% if ec2_config.ecs_cluster is defined %}
+        {
+          "PolicyName": "EC2InstancePolicy",
+          "PolicyDocument": {
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ecs:RegisterContainerInstance",
+                  "ecs:DeregisterContainerInstance"
+                ],
+                "Resource": { "Fn::Join" :
+                  ["",
+                    [
+                      "arn:aws:ecs:",
+                      { "Ref" : "AWS::Region" }, ":",
+                      { "Ref": "AWS::AccountId" },
+                      ":cluster/",
+                      {{ ec2_config.ecs_cluster | to_json }}
+                    ]
+                  ]
+                }
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ecs:DiscoverPollEndpoint",
+                  "ecs:Submit*",
+                  "ecs:Poll",
+                  "ecs:StartTelemetrySession"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+        },
+{% endif %}
+{% if stack.credential_store is defined %}
+        {
+          "PolicyName": "credential-store",
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "ReadOnlyAccessToCredentialStore",
+                "Effect": "Allow",
+                "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:BatchGetItem",
+                    "dynamodb:Scan",
+                    "dynamodb:Query"
+                ],
+                "Resource": [
+{% for table_name in stack.credential_store.tables.keys() %}
+                  { "Fn::Join" :
+                    ["",
+                      [
+                        "arn:aws:dynamodb:",
+                        { "Ref" : "AWS::Region" }, ":",
+                        { "Ref" : "AWS::AccountId" },
+                        ":table/",
+                        { "Ref": "{{ table_name }}" }
+                      ]
+                    ]
+                  },
+{% endfor %}
+                ]
+              }
+            ]
+          }
+        },
+{% endif %}
+{% if ec2_config.inline_policies is defined %}
+{% for policy in ec2_config.inline_policies %}
+        {{ policy | to_json | indent(8, False) }},
+{% endfor %}
+{% endif %}
+        {{ cf_cloudwatch_ec2_logs_policy | to_json }}
+      ]
+  {{ ec2_name + 'InstanceProfile' }}:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+{% if ec2_config.role is defined %}
+        - {{ ec2_config.role | to_json }}
+{% else %}
+        - { "Ref": "{{ ec2_name + 'InstanceRole' }}" }
+{% endif %}
+{% if ec2_config.assign_elastic_ip is defined and ec2_config.assign_elastic_ip %}
+  {{ ec2_name + 'ElasticIp' }}:
+    Type : "AWS::EC2::EIP"
+    Properties :
+      InstanceId: { "Ref": "{{ ec2_name }}" }
+      Domain: vpc
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 5 END - EC2 #}
+{# SECTION 6 BEGIN - EC2 Container Service #}
+{% if stack.ecs is defined %}
+{% for cluster_name, cluster_config in (stack.ecs.clusters|default({})).items() %}
+{% if cluster_config.create | default(True) %}
+  {{ cluster_name }}:
+    Type: "AWS::ECS::Cluster"
+{% endif %}
+{% endfor %}
+{% for name, definition in (stack.ecs.task_definitions|default({})).items() %}
+{% if definition.create | default(True) %}
+  {{ name }}:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions: {{ definition.containers | to_json }}
+      Volumes: {{ definition.volumes | default([]) | to_json }}
+{% endif %}
+{% endfor %}
+{% for service_name, service_config in (stack.ecs.services|default({})).items() %}
+{% if service_config.create | default(True) %}
+  {{ service_name }}:
+    Type: "AWS::ECS::Service"
+    DependsOn: {{ func.mapper(service_config.depends_on|default([])) }}
+    Properties:
+      Cluster: {{ service_config.cluster | to_json }}
+      TaskDefinition: {{ service_config.task_definition | to_json }}
+      DesiredCount: {{ service_config.desired_count | default(0) }}
+{% if service_config.deployment_config is defined %}
+      DeploymentConfiguration:
+        MaximumPercent: {{ service_config.deployment_config.max_percent | default(200) }}
+        MinimumHealthyPercent: {{ service_config.deployment_config.min_healthy_percent | default(100) }}
+{% endif %}
+{% if service_config.load_balancer is defined %}
+      LoadBalancers:
+        - ContainerName: "{{ service_config.load_balancer.container_name }}"
+          ContainerPort: "{{ service_config.load_balancer.container_port }}"
+{% if service_config.load_balancer.name is defined %}
+          LoadBalancerName: {{ service_config.load_balancer.name | to_json }}
+{% else %}
+          TargetGroupArn: {{ service_config.load_balancer.target_group | to_json }}
+{% endif %}
+{% if service_config.load_balancer.role is defined %}
+      Role: {{ service_config.load_balancer.role | to_json }}
+{% else %}
+      Role: { "Ref": "{{ service_name + 'EcsServiceRole' }}" }
+  {{ service_name + 'EcsServiceRole' }}: {
+    "Type": "AWS::IAM::Role",
+    "Properties": {
+      "AssumeRolePolicyDocument": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": [ "ecs.amazonaws.com" ]
+            },
+            "Action": [ "sts:AssumeRole" ]
+          }
+        ]
+      },
+      "Path": "/",
+      "ManagedPolicyArns": [ "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole" ]
+    }
+  }
+{% endif %}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% for task_name, task_config in (stack.ecs.tasks|default({})).items() %}
+{% if task_config.stack_task | default(False) and task_config.create | default(True) %}
+  {{ task_name }}:
+    Type: "Custom::ECSTask"
+    Version: "1.0"
+    DependsOn: {{ task_config.depends_on | default([]) | to_json }}
+    Properties:
+      ServiceToken: {{ task_config.provisioning_topic | default({ "Fn::Join" : ["", [
+          "arn:aws:sns:", { "Ref" : "AWS::Region" }, ":",
+          { "Ref" : "AWS::AccountId" }, ":", "custom-resource-bridge"
+        ] ] }) | to_json }}
+      Cluster: {{ task_config.cluster | to_json }}
+      TaskDefinition: {{ task_config.task_definition | to_json }}
+      UpdateCriteria: {{ task_config.update_criteria | default([]) | to_json }}
+      Timeout: "{{ task_config.timeout | default(900) }}"
+      Count: "{{ task_config.count | default(1) }}"
+      RunOnUpdate: "{{ task_config.run_on_update | default('True') }}"
+      Overrides: {{ task_config.overrides | default({}) | to_json }}
+      Instances: {{ task_config.instances | default([]) | to_json }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 6 END - EC2 Container Service #}
+{# SECTION 7 BEGIN - Relational Database Service #}
+{% for db_name, db_config in (stack.db|default({})).items() %}
+{% if db_config.parameters is defined %}
+  {{ db_name + 'ParameterGroup' }}:
+    Type: "AWS::RDS::DBParameterGroup"
+    Properties:
+      Description: "{{ db_name }}-parameter-group"
+      Family: "{{ db_config.parameter_family | default(db_config.engine + db_config.engine_version | string ) }}"
+      Parameters: {{ db_config.parameters | to_json }}
+{% endif %}
+  {{ db_name }}:
+    Type: "AWS::RDS::DBInstance"
+{% if db_config.deletion_policy is defined %}
+    DeletionPolicy: "{{ db_config.deletion_policy }}"
+{% endif %}
+    Properties:
+      AllocatedStorage: "{{ db_config.allocated_storage | default(30) }}"
+      AutoMinorVersionUpgrade: "{{ db_config.minor_version_upgrade | default('true') }}"
+      BackupRetentionPeriod: "{{ db_config.backup_retention | default(7) }}"
+      PreferredBackupWindow: "{{ db_config.backup_window | default('00:00-02:00') }}"
+      PreferredMaintenanceWindow: "{{ db_config.maintenance_window | default('Sun:02:30-Sun:04:30') }}"
+      StorageType: "{{ db_config.storage_type | default('gp2')  }}"
+      DBInstanceClass: "{{ db_config.instance_class | default('db.t2.micro') }}"
+{% if db_config.snapshot is defined and db_config.snapshot %}
+      DBSnapshotIdentifier: "{{ db_config.snapshot }}"
+{% else %}
+      DBName: "{{ db_config.name }}"
+{% endif %}
+      Engine: "{{ db_config.engine }}"
+      EngineVersion: "{{ db_config.engine_version }}"
+      MasterUsername: "{{ db_config.username }}"
+      MasterUserPassword: {{ db_config.password | to_json }}
+      DBSubnetGroupName: { "Ref": "{{ db_name + 'SubnetGroup' }}" }
+      VPCSecurityGroups:
+{% for group in db_config.security_groups | default([]) %}
+        - {{ group | to_json }}
+{% endfor %}
+        - { "Ref" : "{{ db_name + 'SG' }}" }
+      MultiAZ: "{{ db_config.multi_az | default('true') }}"
+{% if db_config.multi_az | default('true') | string | lower != 'true' %}
+      AvailabilityZone: {{ db_config.availability_zone | default({ "Fn::Join" : ["", [ { "Ref" : "AWS::Region" }, "a" ] ] }) | to_json }}
+{% endif %}
+{% if db_config.parameters is defined %}
+      DBParameterGroupName: { "Ref": "{{ db_name + 'ParameterGroup' }}" }
+{% endif %}
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ db_name }}-rds" }
+{% for tag_name, tag_value in (db_config.tags|default({})).items() %}
+        - { Key: "{{ tag_name }}", Value: "{{ tag_value }}" }
+{% endfor %}
+  {{ db_name + 'SubnetGroup' }}:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: "{{ stack.name }}-{{ db_name }}-db-subnet-group"
+      SubnetIds: [ "{{ db_config.subnet_ids | join('\",\"') }}" ]
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ db_name }}-db-subnet-group" }
+  {{ db_name + 'SG' }}:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "{{ stack.name }}-{{ db_name }}-sg"
+      VpcId: "{{ stack.vpc_id }}"
+      SecurityGroupEgress: [
+{% for rule in db_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{ rule.to_port | default(rule.port) }}",
+{% if dest | ipaddr %}
+          CidrIp: "{{ dest }}",
+{% else %}
+          DestinationSecurityGroupId: {{ dest | to_json }},
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      SecurityGroupIngress: [
+{% for rule in db_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{rule.to_port | default(rule.port) }}",
+{% if source | ipaddr %}
+          CidrIp: "{{ source }}",
+{% else %}
+          SourceSecurityGroupId: {{ source | to_json }},
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ db_name }}-sg" }
+{% for rule in db_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is defined %}
+  {{ (db_name + 'SG' + source.sg + 'SecurityGroupIngress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ db_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ source.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% for rule in db_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is defined %}
+  {{ (db_name + 'SG' + dest.sg + 'SecurityGroupEgress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ db_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ dest.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{# SECTION 7 END - Relational Database Service #}
+{# SECTION 8 BEGIN - ElastiCache Service #}
+{% for cache_name, cache_config in (stack.cache|default({})).items() %}
+  {{ cache_name }}:
+    Type: "AWS::ElastiCache::ReplicationGroup"
+    Properties:
+      ReplicationGroupDescription: "{{stack.name}}-{{ cache_name }}-cache"
+{% if cache_config.failover is defined %}
+      AutomaticFailoverEnabled: "{{ cache_config.failover }}"
+{% elif (cache_config.nodes|default(1)) > 1 %}
+      AutomaticFailoverEnabled: "true"
+{% else %}
+      AutomaticFailoverEnabled: "false"
+{% endif %}
+      NumCacheClusters: "{{ cache_config.nodes | default(1) }}"
+      CacheNodeType: "{{ cache_config.instance_type | default('cache.t2.micro') }}"
+      Port: "{{ cache_config.port | default(6379) }}"
+      Engine: "{{ cache_config.engine | default('redis') }}"
+      EngineVersion: "{{ cache_config.engine_version | default('2.8.6') }}"
+      CacheSubnetGroupName: { "Ref": "{{ cache_name + 'SubnetGroup' }}" }
+{% if cache_config.maintenance_window is defined %}
+      PreferredMaintenanceWindow: "{{ cache_config.maintenance_window }}"
+{% endif %}
+{% if cache_config.snapshot_window is defined and not (cache_config.instance_type | match('cache\\.t2.*')) %}
+      SnapshotWindow: "{{ cache_config.snapshot_window }}"
+{% endif %}
+      SecurityGroupIds:
+{% if cache_config.security_groups is defined %}
+{% for group in cache_config.security_groups %}
+        - {{ group | to_json }}
+{% endfor %}
+{% else %}
+        - { "Ref" : "{{ cache_name + 'SG' }}" }
+{% endif %}
+{% if cache_config.notification_topic is defined %}
+      NotificationTopicArn: {{ cache_config.notification_topic | to_json }}
+{% endif %}
+  {{ cache_name + 'SubnetGroup' }}:
+    Type: "AWS::ElastiCache::SubnetGroup"
+    Properties:
+      Description: "{{ stack.name }}-{{ cache_name }}-cache-subnet-group"
+      SubnetIds: [ "{{ cache_config.subnet_ids | join('\",\"') }}" ]
+{% if cache_config.security_groups is not defined %}
+  {{ cache_name + 'SG' }}:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "{{ stack.name }}-{{ cache_name }}-sg"
+      VpcId: "{{ stack.vpc_id }}"
+      SecurityGroupEgress: [
+{% for rule in cache_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{ rule.to_port | default(rule.port) }}",
+{% if dest | ipaddr %}
+          CidrIp: "{{ dest }}",
+{% else %}
+          DestinationSecurityGroupId: {{ dest | to_json }},
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      SecurityGroupIngress: [
+{% for rule in cache_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is not defined %}
+        {
+          IpProtocol: "{{ rule.protocol }}",
+          FromPort: "{{ rule.from_port | default(rule.port) }}",
+          ToPort: "{{rule.to_port | default(rule.port) }}",
+{% if source | ipaddr %}
+          CidrIp: "{{ source }}",
+{% else %}
+          SourceSecurityGroupId: {{ source | to_json }},
+{% endif %}
+        },
+{% endif %}
+{% endfor %}
+{% endfor %}
+      ]
+      Tags:
+        - { Key: "Name", Value: "{{ stack.name }}-{{ cache_name }}-sg" }
+{% for rule in cache_config.ingress_security_rules | default([]) %}
+{% for source in rule.permit %}
+{% if source.sg is defined %}
+  {{ (cache_name + 'SG' + source.sg + 'SecurityGroupIngress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ cache_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ source.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% for rule in cache_config.egress_security_rules | default([]) %}
+{% for dest in rule.permit %}
+{% if dest.sg is defined %}
+  {{ (cache_name + 'SG' + dest.sg + 'SecurityGroupEgress' + rule.protocol|string|capitalize + rule.from_port|default(rule.port)|string) | regex_replace('[^a-zA-Z0-9]*', '')  }}:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      IpProtocol: "{{ rule.protocol }}"
+      FromPort: "{{ rule.from_port | default(rule.port) }}"
+      ToPort: "{{rule.to_port | default(rule.port) }}"
+      GroupId: { "Ref": "{{ cache_name + 'SG' }}" }
+      SourceSecurityGroupId: { "Ref": "{{ dest.sg }}" }
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{# SECTION 8 END - ElastiCache Service #}
+{# SECTION 9 BEGIN - Elastisearch Service #}
+{% if stack.elasticsearch is defined %}
+{% for domain_name, domain_config in (stack.elasticsearch|default({})).items() %}
+  {{ domain_name }}:
+    Type: "AWS::Elasticsearch::Domain"
+    Properties:
+{% if domain_config.name is defined %}
+      DomainName: {{ domain_config.name | to_json }}
+{% endif %}
+      ElasticsearchClusterConfig:
+        InstanceCount: "{{ domain_config.instance_count }}"
+        InstanceType: "{{ domain_config.instance_type|default('t2.micro.elasticsearch') }}"
+        ZoneAwarenessEnabled: "{{ domain_config.zone_aware|default(true) }}"
+{% if domain_config.dedicated_master is defined %}
+        DedicatedMasterEnabled: true
+        DedicatedMasterCount: "{{ domain_config.dedicated_master.instance_count }}"
+        DedicatedMasterType: "{{ domain_config.dedicated_master.instance_type|default('t2.micro.elasticsearch') }}"
+{% endif %}
+{% if domain_config.snapshot_hour_utc is defined and domain_config.snapshot_hour_utc %}
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: "{{ domain_config.snapshot_hour_utc }}"
+{% endif %}
+{% if domain_config.ebs is defined %}
+      EBSOptions:
+          EBSEnabled: true
+          VolumeSize: "{{ domain_config.ebs.volume_size }}"
+          VolumeType: "{{ domain_config.ebs.volume_type|default('gp2') }}"
+          Iops: "{{ domain_config.ebs.iops|default('0') }}"
+{% endif %}
+{% if domain_config.advanced is defined %}
+      AdvancedOptions: {{ domain_config.advanced | to_json }}
+{% endif %}
+{% if domain_config.access_policies is defined %}
+      AccessPolicies: {
+        "Version": "2012-10-17",
+        "Statement": [
+{% if domain_config.access_policies.readwrite_users is defined and domain_config.access_policies.readwrite_users %}
+          {
+            "Action": "es:*",
+            "Effect": "Allow",
+            "Principal": { "AWS": {{ func.mapper(domain_config.access_policies.readwrite_users) }} },
+            "Resource": "*"
+          },
+{% endif %}
+{% if domain_config.access_policies.readonly_users is defined and domain_config.access_policies.readonly_users %}
+          {
+            "Action": [ "es:ESHttpGet", "es:ESHttpHead" ],
+            "Effect": "Allow",
+            "Principal": { "AWS": {{ func.mapper(domain_config.access_policies.readonly_users) }} },
+            "Resource": "*"
+          },
+{% endif %}
+{% if domain_config.access_policies.readwrite_ips is defined and domain_config.access_policies.readwrite_ips %}
+          {
+            "Action": "es:*",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Condition": {
+              "IpAddress": {
+                "aws:SourceIp": {{ domain_config.access_policies.readwrite_ips | to_json }}
+              }
+            },
+            "Resource": "*"
+          },
+{% endif %}
+{% if domain_config.access_policies.readonly_ips is defined and domain_config.access_policies.readonly_ips %}
+          {
+            "Action": [ "es:ESHttpGet", "es:ESHttpHead" ],
+            "Effect": "Allow",
+            "Principal": "*",
+            "Condition": {
+              "IpAddress": {
+                "aws:SourceIp": {{ domain_config.access_policies.readonly_ips | to_json }}
+              }
+            },
+            "Resource": "*"
+          },
+{% endif %}
+{% for policy in domain_config.custom_policies | default([]) %}
+          {
+            "Action": {{ policy.Action | to_json }},
+            "Effect": {{ policy.Effect | to_json }},
+{% if policy.Principal is defined %}
+            "Principal": { 
+              "AWS": [
+{% for principal in policy.Principal %}
+{% if principal.iam is defined %}
+                { "Fn::GetAtt" : [ "{{ principal.iam + 'InstanceRole' }}", "Arn" ] },
+{% else %}
+                {{ principal | to_json }},
+{% endif %}
+{% endfor %}
+              ] 
+            },
+{% elif policy.SourceIp is defined %}
+            "Principal": "*",
+            "Condition": {
+              "IpAddress": {
+                "aws:SourceIp": [
+{% for source_ip in policy.SourceIp %}
+                  {{ source_ip | to_json }},
+{% endfor %}
+                ]
+              }
+            },
+ {% endif %}
+{% if policy.Resource is defined %}
+            "Resource": {{ policy.Resource | to_json }},
+{% endif %}
+          },
+{% endfor %}
+        ]
+      }
+{% endif %}
+{% if domain_config.tags is defined %}
+      Tags: {{ domain_config.tags | to_json }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 9 END - Elastisearch Service #}
+{# SECTION 10 BEGIN - S3 Buckets #}
+{% if stack.s3 is defined %}
+{% for bucket_name, bucket_config in (stack.s3|default({})).items() %}
+{% if bucket_config.create | default(True) %}
+  {{ bucket_name }}:
+    Type: "AWS::S3::Bucket"
+    Properties:
+{% if bucket_config.name is defined %}
+      BucketName: "{{ bucket_config.name }}"
+{% endif %}
+{% if bucket_config.access_control is defined %}
+      AccessControl: "{{ bucket_config.access_control }}"
+{% endif %}
+{% if bucket_config.cors_config is defined and bucket_config.cors_config %}
+      CorsConfiguration: {{ bucket_config.cors_config | to_json }}
+{% endif %}
+{% if bucket_config.lifecycle_config is defined and bucket_config.lifecycle_config %}
+      LifecycleConfiguration: {{ bucket_config.lifecycle_config | to_json }}
+{% endif %}
+{% if bucket_config.logging_config is defined and bucket_config.logging_config %}
+      LoggingConfiguration: {{ bucket_config.logging_config | to_json }}
+{% endif %}
+{% if bucket_config.notification_config is defined and bucket_config.notification_config %}
+      NotificationConfiguration: {{ bucket_config.notification_config | to_json }}
+{% endif %}
+{% if bucket_config.replication_config is defined and bucket_config.replication_config %}
+      ReplicationConfiguration: {{ bucket_config.replication_config | to_json }}
+{% endif %}
+{% if bucket_config.tags is defined %}
+      Tags: {{ bucket_config.tags | to_json }}
+{% endif %}
+{% if bucket_config.versioning_config is defined and bucket_config.versioning_config %}
+      VersioningConfiguration: {{ bucket_config.versioning_config | to_json }}
+{% endif %}
+{% if bucket_config.website_config is defined and bucket_config.website_config %}
+      WebsiteConfiguration: {{ bucket_config.website_config | to_json }}
+{% endif %}
+{% if bucket_config.policy is defined %}
+  {{ bucket_name + 'Policy' }}: {
+    "Type": "AWS::S3::BucketPolicy",
+    "Properties": {
+      "Bucket" : { "Ref" : "{{ bucket_name }}" },
+      "PolicyDocument": {
+        "Statement": [
+{% if bucket_config.policy.readwrite_users is defined and bucket_config.policy.readwrite_users %}
+          {
+            "Action": "s3:*",
+            "Effect": "Allow",
+            "Principal": { "AWS": {{ func.mapper(bucket_config.policy.readwrite_users) }} },
+            "Resource": [
+              "{{ 'arn:aws:s3:::' + bucket_config.name }}",
+              "{{ 'arn:aws:s3:::' + bucket_config.name + '/*' }}"
+            ]
+          },
+{% endif %}
+{% if bucket_config.policy.readonly_users is defined and bucket_config.policy.readonly_users %}
+          {
+            "Action": [ "s3:GetObject" ],
+            "Effect": "Allow",
+            "Principal": { "AWS": {{ func.mapper(bucket_config.policy.readonly_users) }} },
+            "Resource": [
+              "{{ 'arn:aws:s3:::' + bucket_config.name + '/*' }}"
+            ]
+          },
+{% endif %}
+{% if bucket_config.policy.listonly_users is defined and bucket_config.policy.listonly_users %}
+          {
+            "Action": "s3:ListBucket",
+            "Effect": "Allow",
+            "Principal": { "AWS": {{ func.mapper(bucket_config.policy.listonly_users) }} },
+            "Resource": [
+              "{{ 'arn:aws:s3:::' + bucket_config.name }}"
+            ]
+          }
+{% endif %}
+        ]
+      }
+    }
+  }
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 10 END - S3 Buckets #}
+{# SECTION 11 BEGIN - Credential Store #}
+{% if stack.credential_store is defined %}
+{% for table_name, table_config in stack.credential_store.tables.items() %}
+{% if stack.credential_store.provisioning_key is defined %}
+  {{ table_name }}{{ stack.credential_store.provisioning_suffix | default('Provisioner') }}:
+    Type: "Custom::Credstash"
+    Version: "1.0"
+    Properties:
+      ServiceToken: {{ stack.credential_store.provisioning_topic | default({ "Fn::Join" : ["", [
+        "arn:aws:sns:", { "Ref" : "AWS::Region" }, ":",
+        { "Ref" : "AWS::AccountId" }, ":", "custom-resource-bridge"
+      ] ] }) | to_json }}
+      Table: { "Ref": "{{ table_name }}" }
+      KeyId: { "Ref": "CredentialStoreMasterKey" }
+      Data: "{{ table_config | to_json | encrypt(stack.credential_store.provisioning_key, salt=stack.credential_store.salt|default('')) }}"
+{% endif %}
+  {{ table_name }}:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      TableName: "{{ table_name }}"
+      KeySchema:
+        - AttributeName: "name"
+          KeyType: "HASH"
+        - AttributeName: "version"
+          KeyType: "RANGE"
+      AttributeDefinitions:
+        - AttributeName: "name"
+          AttributeType: "S"
+        - AttributeName: "version"
+          AttributeType: "S"
+      ProvisionedThroughput:
+        ReadCapacityUnits: "1"
+        WriteCapacityUnits: "1"
+{% endfor %}
+  CredentialStoreMasterKey:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Description: { "Fn::Join" : ["", [ "Credential Store Master Key for ", { "Ref" : "AWS::StackName" } ] ] }
+      Enabled: "true"
+      KeyPolicy: {
+        "Version": "2012-10-17",
+        "Id": "key-default-1",
+        "Statement": [
+          {
+            "Sid": "Allow root account access to key",
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": {
+                "Fn::Join" : ["", [
+                  "arn:aws:iam::",
+                  { "Ref" : "AWS::AccountId" },
+                  ":root"
+                ] ]
+              }
+            },
+            "Action": "kms:*",
+            "Resource": "*"
+          },
+          {
+            "Sid": "Allow administration of the key",
+            "Effect": "Allow",
+            "Principal": { "AWS": [
+{% for admin in stack.credential_store.key_admins|default([]) %}
+              "{{ admin }}",
+{% endfor %}
+            ] },
+            "Action": [
+              "kms:Create*",
+              "kms:Describe*",
+              "kms:Enable*",
+              "kms:List*",
+              "kms:Put*",
+              "kms:Update*",
+              "kms:Revoke*",
+              "kms:Disable*",
+              "kms:Get*",
+              "kms:Delete*",
+              "kms:ScheduleKeyDeletion",
+              "kms:CancelKeyDeletion"
+            ],
+            "Resource": "*"
+          },
+          {
+            "Sid": "Allow operator use of the key",
+            "Effect": "Allow",
+            "Principal": { "AWS": [
+{% for operator in stack.credential_store.key_operators|default([]) %}
+              "{{ operator }}",
+{% endfor %}
+            ] },
+            "Action": [
+              "kms:Encrypt",
+              "kms:Decrypt",
+              "kms:ReEncrypt*",
+              "kms:GenerateDataKey*",
+              "kms:DescribeKey"
+            ],
+            "Resource": "*"
+          },
+          {
+            "Sid": "Allow use of the key for decryption",
+            "Effect": "Allow",
+            "Principal": { "AWS": {{ func.mapper(stack.credential_store.key_users|default([])) }} },
+            "Action": [
+              "kms:Decrypt",
+              "kms:DescribeKey"
+            ],
+            "Resource": "*"
+          }
+        ]
+      }
+{% endif %}
+{# SECTION 11 END - Credential Store #}
+{# SECTION 12 BEGIN - Cloudwatch Alarms #}
+{% if (stack.cloudwatch|default({})).alarms is defined and (stack.cloudwatch|default({})).alarms %}
+  {{ stack.cloudwatch.alarms.topic }}:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "{{ stack.cloudwatch.alarms.topic }} topic"
+      Subscription: [
+{% for subscription in stack.cloudwatch.alarms.subscriptions|default([]) %}
+        { Endpoint: "{{ subscription.endpoint }}", Protocol: "{{ subscription.protocol }}" },
+{% endfor %}
+      ]
+{# ELB Alarms #}
+{% if stack.elb is defined %}
+{% for elb_name, elb_config in stack.elb.items() %}
+{% if elb_config.monitoring | default(true) and elb_config.create | default(true) %}
+  {{ elb_name + 'Latency' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: ELB latency check
+      MetricName: Latency
+      Namespace: AWS/ELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: LoadBalancerName
+          Value: { "Ref": "{{ elb_name }}" }
+  {{ elb_name + 'UnHealthyHostCount' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: ELB unhealthy host check
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ELB
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 10
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: LoadBalancerName
+          Value: { "Ref": "{{ elb_name }}" }
+  {{ elb_name + 'HTTPCodeELB5XX' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: ELB HTTP 5XX code check
+      MetricName: HTTPCode_ELB_5XX
+      Namespace: AWS/ELB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: LoadBalancerName
+          Value: { "Ref": "{{ elb_name }}" }
+  {{ elb_name + 'BackendConnectionErrors' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: ELB backend connection errors check
+      MetricName: BackendConnectionErrors
+      Namespace: AWS/ELB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 10
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: LoadBalancerName
+          Value: { "Ref": "{{ elb_name }}" }
+{% endif %}
+{% endfor %}
+{% endif %}
+{# CloudFront Alarms #}
+{% if stack.cloudfront is defined %}
+{% for distro_name, distro_config in stack.cloudfront.items() %}
+{% if distro_config.monitoring | default(True) and distro_config.create | default(True) %}
+  {{ distro_name + '5xxErrorRate' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: CloudFront 5xx error rate
+      MetricName: 5xxErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DistributionId
+          Value: { "Ref": "{{ distro_name }}" }
+  {{ distro_name + '4xxErrorRate' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: CloudFront 4xx error rate
+      MetricName: 4xxErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DistributionId
+          Value: { "Ref": "{{ distro_name }}" }
+{% endif %}
+{% endfor %}
+{% endif %}
+{# DynamoDB Alarms (Credential Store) #}
+{% if stack.credential_store is defined %}
+{% for table_name in stack.credential_store.tables.keys() %}
+  {{ table_name + 'SuccessfulRequestLatency' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: DynamoDB credential store successful request latency
+      MetricName: SuccessfulRequestLatency
+      Namespace: AWS/DynamoDB
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 500
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: TableName
+          Value: "{{ table_name }}"
+  {{ table_name + 'SystemErrors' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: DynamoDB credential store system errors check
+      MetricName: SystemErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: TableName
+          Value: "{{ table_name }}"
+{% endfor %}
+{% endif %}
+{# Elasticsearch Alarms #}
+{% if stack.elasticsearch is defined %}
+{% for domain_name, domain_config in stack.elasticsearch.items() %}
+{% if domain_config.monitoring | default(True) and domain_config.create | default(True) %}
+{% if domain_config.instance_type | default('t2.micro.elasticsearch') | search("t2") %}
+  {{ domain_name + 'CPUCreditBalance' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Data nodes low CPU credit balance
+      MetricName: CPUCreditBalance
+      Namespace: AWS/ES
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: "{{ domain_config.instance_count | int * 15 }}"
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+{% endif %}
+  {{ domain_name + 'CPUUtilization' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Data nodes CPU utilization check
+      MetricName: CPUUtilization
+      Namespace: AWS/ES
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 60
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+  {{ domain_name + 'JVMMemoryPressure' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Data nodes JVM memory pressure
+      MetricName: JVMMemoryPressure
+      Namespace: AWS/ES
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+{% if domain_config.dedicated_master is defined %}
+{% if domain_config.instance_type | default('t2.micro.elasticsearch') | search("t2") %}
+  {{ domain_name + 'MasterCPUCreditBalance' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Master low CPU credit balance
+      MetricName: MasterCPUCreditBalance
+      Namespace: AWS/ES
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 15
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+{% endif %}
+  {{ domain_name + 'MasterCPUUtilization' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Master CPU utilization check
+      MetricName: MasterCPUUtilization
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 60
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+  {{ domain_name + 'MasterJVMMemoryPressure' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Master JVM memory pressure
+      MetricName: MasterJVMMemoryPressure
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+{% endif %}
+  {{ domain_name + 'ClusterStatusYellow' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Cluster Status yellow check
+      MetricName: ClusterStatus.yellow
+      Namespace: AWS/ES
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+  {{ domain_name + 'ClusterStatusRed' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Cluster Status red check
+      MetricName: ClusterStatus.red
+      Namespace: AWS/ES
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+  {{ domain_name + 'Nodes' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Cluster node count check
+      MetricName: Nodes
+      Namespace: AWS/ES
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 15
+      Threshold: "{{ domain_config.instance_count }}"
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+  {{ domain_name + 'FreeStorageSpace' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Data node free storage check
+      MetricName: FreeStorageSpace
+      Namespace: AWS/ES
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 100
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+  {{ domain_name + 'DiskQueueLength' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Data node disk queue length check
+      MetricName: DiskQueueLength
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+  {{ domain_name + 'ReadLatency' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Data node disk read latency check
+      MetricName: ReadLatency
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+  {{ domain_name + 'WriteLatency' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Data node disk write latency check
+      MetricName: WriteLatency
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DomainName
+          Value: { "Ref": "{{ domain_name }}" }
+{% endif %}
+{% endfor %}
+{% endif %}
+{# EC2 Alarms #}
+{% if stack.db is defined %}
+{% for db_name, db_config in stack.db.items() %}
+{% if db_config.monitoring | default(True) and db_config.create | default(True) %}
+  {{ db_name + 'CPUUtilization' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: RDS Instance CPU utilization check
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: { "Ref": "{{ db_name }}" }
+  {{ db_name + 'FreeStorageSpace' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: RDS Instance free storage space check
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: {{ db_config.allocated_storage | int * 150000 }}
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: { "Ref": "{{ db_name }}" }
+  {{ db_name + 'FreeableMemory' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: RDS Instance freeable memory check
+      MetricName: FreeableMemory
+      Namespace: AWS/RDS
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 100000000
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: { "Ref": "{{ db_name }}" }
+  {{ db_name + 'Connections' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: RDS Instance connections
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: { "Ref": "{{ db_name }}" }
+  {{ db_name + 'DiskQueueDepth' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: RDS Instance disk queue depth
+      MetricName: DiskQueueDepth
+      Namespace: AWS/RDS
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: { "Ref": "{{ db_name }}" }
+  {{ db_name + 'ReadLatency' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: RDS Instance read latency
+      MetricName: ReadLatency
+      Namespace: AWS/RDS
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: { "Ref": "{{ db_name }}" }
+  {{ db_name + 'WriteLatency' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: RDS Instance write latency
+      MetricName: WriteLatency
+      Namespace: AWS/RDS
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: { "Ref": "{{ db_name }}" }
+{% if db_config.instance_class | search("t2") %}
+  {{ db_name + 'CPUCreditBalance' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: RDS Instance low CPU credit balance
+      MetricName: CPUCreditBalance
+      Namespace: AWS/RDS
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 15
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: { "Ref": "{{ db_name }}" }
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# EC2 Autoscaling Alarms #}
+{% if (stack.ec2|default({})).autoscaling is defined and (stack.ec2|default({})).monitoring | default(true) %}
+{% for asg_name, asg_config in stack.ec2.autoscaling.items() %}
+{% if asg_config.create | default(true) and asg_config.desired_size > 0 and asg_config.instance_type | search("t2") and asg_config.monitoring | default (true) %}
+  {{ asg_name + 'CPUCreditBalance' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Autoscaling group low CPU credit balance
+      MetricName: CPUCreditBalance
+      Namespace: AWS/EC2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: "{{ asg_config.desired_size | int * 15 }}"
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: { "Ref": "{{ asg_name }}" }
+{% endif %}
+{% if asg_config.monitoring | default(true) and asg_config.create | default(true) and asg_config.desired_size > 0 %}
+  {{ asg_name + 'CPUUtilization' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Autoscaling group CPU utilization check
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: { "Ref": "{{ asg_name }}" }
+  {{ asg_name + 'StatusCheck' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: Autoscaling group status check
+      MetricName: StatusCheckFailed
+      Namespace: AWS/EC2
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: { "Ref": "{{ asg_name }}" }
+{% endif %}
+{% endfor %}
+{% endif %}
+{# ECS Alarms #}
+{% if (stack.ecs|default({})).services is defined and (stack.ecs|default({})).monitoring | default(true) %}
+  StackResourcesIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: [ "sts:AssumeRole" ]
+      Path: "/"
+      Policies:
+      - PolicyName: "StackResourcesPolicy"
+        PolicyDocument:
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "cloudformation:ListStackResources"
+              - "cloudformation:DescribeStacks"
+            Resource: { "Ref": "AWS::StackId" }
+          - Effect: "Allow"
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            - "logs:DescribeLogStreams"
+            Resource: { "Fn::Join": ["", [
+                "arn:aws:logs:", { "Ref": "AWS::Region" }, ":", { "Ref": "AWS::AccountId" },
+                "{{ ':log-group:/aws/lambda/' + stack.name + '-cfnStackResources' }}", "*"
+            ] ] }
+  StackResources:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "{{ stack.name + '-cfnStackResources'}}"
+      Code:
+        S3Bucket: { "Fn::FindInMap": [ "LambdaS3Mappings", { "Ref" : "AWS::Region" }, { "Ref" : "AWS::AccountId" } ] }
+        S3Key: cfnStackResources.zip
+      Description: "CloudFormation Stack Resources Lambda Function"
+      Handler: stack_resources.handler
+      Runtime: python2.7
+      Timeout: 60
+      Role: { "Fn::GetAtt": [ "StackResourcesIAMRole", "Arn" ] }
+  ECSServiceResources:
+    Type: "Custom::StackResources"
+    DependsOn:
+{% for service_name, service_config in stack.ecs.services.items() %}
+{% if service_config.monitoring | default(True) and service_config.create | default(True) %}
+      - "{{ service_name }}"
+{% endif %}
+{% endfor %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["StackResources", "Arn"] }
+      ResourceTypes:
+        - "AWS::ECS::Service"
+      Substitution:
+        Pattern: "arn:aws:ecs:.*:service/(.*)"
+        Replacement: "\\1"
+      Triggers:
+{% for service_name, service_config in stack.ecs.services.items() %}
+{% if service_config.monitoring | default(True) and service_config.create | default(True) %}
+      - { "Ref": "{{ service_name }}" }
+{% endif %}
+{% endfor %}
+{% for service_name, service_config in stack.ecs.services.items() %}
+{% if service_config.desired_count > 0  and service_config.monitoring | default(True) and service_config.create | default(True) %}
+  {{ service_name + 'Count' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: ECS service running task count
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: SampleCount
+      Period: 60
+      EvaluationPeriods: 10
+      Threshold: "{{ service_config.desired_count }}"
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: ClusterName
+          Value: {{ service_config.cluster | to_json }}
+        - Name: ServiceName
+          Value: { "Fn::GetAtt" : [ "ECSServiceResources", "{{ service_name }}"] }
+  {{ service_name + 'MemoryUtilization' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: ECS service high memory utilization
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: ClusterName
+          Value: {{ service_config.cluster | to_json }}
+        - Name: ServiceName
+          Value: { "Fn::GetAtt" : [ "ECSServiceResources", "{{ service_name }}"] }
+  {{ service_name + 'CPUUtilization' }}:
+    Type: "AWS::CloudWatch::Alarm"
+    DependsOn:
+      - "{{ stack.cloudwatch.alarms.topic }}"
+    Properties:
+      AlarmDescription: ECS service high CPU utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      OKActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      InsufficientDataActions:
+        - { "Ref": "{{ stack.cloudwatch.alarms.topic }}" }
+      Dimensions:
+        - Name: ClusterName
+          Value: {{ service_config.cluster | to_json }}
+        - Name: ServiceName
+          Value: { "Fn::GetAtt" : [ "ECSServiceResources", "{{ service_name }}"] }
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+{# SECTION 12 END - Cloudwatch #}
+{# SECTION 13 BEGIN - Custom Resources #}
+{% if stack.resources is defined and stack.resources is not mapping %}
+{% for resource in stack.resources|default([]) %}
+{% if resource.create | default(True) %}
+  {{ resource.name }}: {{ resource.config | to_json }}
+{% endif %}
+{% endfor %}
+{% else %}
+{% for resource_name, resource_config in (stack.resources|default({})).items() %}
+  {{ resource_name }}:
+    Type: "{{ resource_config.Type }}"
+{% if resource_config.DependsOn is defined %}
+    DependsOn: {{ resource_config.DependsOn | to_json }}
+{% endif %}
+{% if resource_config.Properties is defined %}
+    Properties:
+{% for property_name, property_config in resource_config.Properties.items() %}
+      {{ property_name }}: {{ property_config | to_json }}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 13 END - Custom Resources #}
+{# SECTION 14 BEGIN - CloudFront #}
+{% if stack.cloudfront is defined %}
+{% for distro_name, distro_config in (stack.cloudfront|default({})).items() %}
+{% if distro_config.create | default(True) %}
+  {{ distro_name }}:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+{% if distro_config.aliases is defined and distro_config.aliases %}
+        Aliases: {{ distro_config.aliases | to_json }}
+{% endif %}
+{% if distro_config.cache_behaviors is defined and distro_config.cache_behaviors %}
+        CacheBehaviors: {{ distro_config.cache_behaviors | to_json }}
+{% endif %}
+{% if distro_config.comment is defined %}
+        Comment: "{{ distro_config.comment }}"
+{% endif %}
+{% if distro_config.custom_error_responses is defined and distro_config.custom_error_responses %}
+        CustomErrorResponses: {{ distro_config.custom_error_responses | to_json }}
+{% endif %}
+        DefaultCacheBehavior: {{ distro_config.default_cache_behavior | to_json }}
+{% if distro_config.default_root is defined %}
+        DefaultRootObject: "{{ distro_config.default_root }}"
+{% endif %}
+        Enabled: "{{ distro_config.enabled | default('True') }}"
+{% if distro_config.logging is defined and distro_config.logging %}
+        Logging: {{ distro_config.logging | to_json }}
+{% endif %}
+        Origins:
+{% for custom_origin_name, custom_origin_config in (distro_config.custom_origins | default({})).items() %}
+        - Id: "{{ custom_origin_name }}"
+          DomainName: {{ custom_origin_config.domain_name | to_json }}
+{% if custom_origin_config.path is defined %}
+          OriginPath: "{{ custom_origin_config.path }}"
+{% endif %}
+          CustomOriginConfig:
+            OriginProtocolPolicy: "{{ custom_origin_config.protocol_policy }}"
+{% if custom_origin_config.http_port is defined %}
+            HTTPPort: "{{ custom_origin_config.http_port }}"
+{% endif %}
+{% if custom_origin_config.https_port is defined %}
+            HTTPSPort: "{{ custom_origin_config.https_port }}"
+{% endif %}
+{% endfor %}
+{% for s3_origin_name, s3_origin_config in (distro_config.s3_origins | default({})).items() %}
+        - Id: "{{ s3_origin_name }}"
+          DomainName: {{ s3_origin_config.domain_name | to_json }}
+{% if s3_origin_config.path is defined %}
+          OriginPath: "{{ s3_origin_config.path }}"
+{% endif %}
+{% if s3_origin_config.access_identity is defined %}
+          S3OriginConfig:
+            OriginAccessIdentity: "{{ s3_origin_config.access_identity }}"
+{% else %}
+          S3OriginConfig: {}
+{% endif %}
+{% endfor %}
+{% if distro_config.price_class is defined %}
+        PriceClass: "{{ distro_config.price_class }}"
+{% endif %}
+{% if distro_config.restrictions is defined and distro_config.restrictions %}
+        Restrictions: {{ distro_config.restrictions | to_json }}
+{% endif %}
+{% if distro_config.viewer_certificate is defined and distro_config.viewer_certificate %}
+        ViewerCertificate: {{ distro_config.viewer_certificate | to_json }}
+{% endif %}
+{% if distro_config.web_acl_id is defined %}
+        WebACLId: {{ distro_config.web_acl_id | to_json }}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 14 END - CloudFront #}
+{# SECTION 15 BEGIN - WAF #}
+{% if stack.waf is defined and (stack.waf.create | default(True)) %}
+{% for acl_name, acl_config in (stack.waf.acls|default({})).items() %}
+  {{ acl_name }}:
+    Type: "AWS::WAF::WebACL"
+    Properties:
+      Name: "{{ stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '') + acl_name }}"
+      MetricName: "{{ acl_config.metric_name | default(stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '')) + acl_name }}"
+      DefaultAction:
+        Type: "{{ acl_config.default_action }}"
+      Rules:
+{% for rule in acl_config.rules %}
+        - RuleId: {{ rule.id | to_json }}
+          Priority: "{{ rule.priority }}"
+          Action:
+            Type: "{{ rule.action }}"
+{% endfor %}
+{% endfor %}
+{% for rule_name, rule_config in (stack.waf.rules|default({})).items() %}
+  {{ rule_name }}:
+    Type: "AWS::WAF::Rule"
+    Properties:
+      Name: "{{ stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '') + rule_name }}"
+      MetricName: "{{ rule_config.metric_name | default(stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '')) + rule_name }}"
+      Predicates:
+{% for predicate in rule_config.predicates %}
+        - Negated: "{{ predicate.negated | default('False') }}"
+{% if predicate.string_match is defined %}
+          Type: "ByteMatch"
+          DataId: {{ predicate.string_match | to_json }}
+{% elif predicate.ip_match is defined %}
+          Type: "IPMatch"
+          DataId: {{ predicate.ip_match | to_json }}
+{% elif predicate.size_constraint is defined %}
+          Type: "SizeConstraint"
+          DataId: {{ predicate.size_constraint | to_json }}
+{% elif predicate.sql_injection_match is defined %}
+          Type: "SqlInjectionMatch"
+          DataId: {{ predicate.sql_injection_match | to_json }}
+{% elif predicate.xss_match is defined %}
+          Type: "XssMatch"
+          DataId: {{ predicate.xss_match | to_json }}
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% for string_match_name, string_match_config in (stack.waf.string_match|default({})).items() %}
+  {{ string_match_name }}:
+    Type: "AWS::WAF::ByteMatchSet"
+    Properties:
+      Name: "{{ string_match_config.name | default(stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '')) + string_match_name }}"
+      ByteMatchTuples: {{ string_match_config.tuples | to_json }}
+{% endfor %}
+{% for ip_match_name, ip_match_config in (stack.waf.ip_match|default({})).items() %}
+  {{ ip_match_name }}:
+    Type: "AWS::WAF::IPSet"
+    Properties:
+      Name: "{{ ip_match_config.name | default(stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '')) + ip_match_name }}"
+      IPSetDescriptors:
+{% for cidr_range in ip_match_config.cidr_ranges %}
+        - Type: IPV4
+          Value: "{{ cidr_range }}"
+{% endfor %}
+{% endfor %}
+{% for size_constraint_name, size_constraint_config in (stack.waf.size_constraint|default({})).items() %}
+  {{ size_constraint_name }}:
+    Type: "AWS::WAF::SizeConstraintSet"
+    Properties:
+      Name: "{{ size_constraint_config.name | default(stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '')) + size_constraint_name }}"
+      SizeConstraints: {{ size_constraint_config.constraints | to_json }}
+{% endfor %}
+{% for sql_injection_match_name, sql_injection_match_config in (stack.waf.sql_injection_match|default({})).items() %}
+  {{ sql_injection_match_name }}:
+    Type: "AWS::WAF::SqlInjectionMatchSet"
+    Properties:
+      Name: "{{ sql_injection_match_config.name | default(stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '')) + sql_injection_match_name }}"
+      SqlInjectionMatchTuples: {{ sql_injection_match_config.tuples | to_json }}
+{% endfor %}
+{% for xss_match_name, xss_match_config in (stack.waf.xss_match|default({})).items() %}
+  {{ xss_match_name }}:
+    Type: "AWS::WAF::XssMatchSet"
+    Properties:
+      Name: "{{ xss_match_config.name | default(stack.name | regex_replace('[^a-zA-Z0-9]', ' ') | title | regex_replace('\s', '')) + xss_match_name }}"
+      XssMatchTuples: {{ xss_match_config.tuples | to_json }}
+{% endfor %}
+{% endif %}
+{# SECTION 15 END - WAF #}
+{# SECTION 16 BEGIN - Lambda #}
+{% for fn_name, fn_config in (stack.lambda|default({})).items() %}
+{% if fn_config.create | default(True) %}
+  {{ fn_name }}:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "{{ fn_config.description | default(fn_name + ' Lambda Function') }}"
+      Handler: "{{ fn_config.handler }}"
+      MemorySize: "{{ fn_config.memory | default (128) }}"
+      Runtime: "{{ fn_config.runtime | default('python2.7') }}"
+      Timeout: "{{ fn_config.timeout | default(60) }}"
+      Role: {{ fn_config.role | to_json }}
+{% if fn_config.name is defined %}
+      FunctionName: "{{ fn_config.name }}"
+{% endif %}
+      Code:
+        S3Bucket: {{ fn_config.s3_bucket | default({ "Fn::FindInMap": [ "LambdaS3Mappings", { "Ref" : "AWS::Region" }, { "Ref" : "AWS::AccountId" } ] }) | to_json }}
+        S3Key: "{{ fn_config.s3_path }}"
+{% if fn_config.version is defined %}
+        S3ObjectVersion: "{{ fn_config.version }}"
+{% endif %}
+{% if fn_config.vpc is defined %}
+        VpcConfig:
+          SecurityGroupIds: "{{ fn_config.vpc.security_group_ids }}"
+          SubnetIds: "{{ fn_config.vpc.subnet_ids }}"
+{% endif %}
+{% endif %}
+{% endfor %}
+{# SECTION 16 END - Lambda #}
+{# SECTION 17 BEGIN - IAM Roles #}
+{% if stack.iam is defined and stack.iam.roles is defined %}
+{% for role_name, role_config in stack.iam.roles.items() %}
+{% if role_config.create | default(True) %}
+  {{ role_name }}:
+    Type: AWS::IAM::Role
+    DependsOn: {{ role_config.depends_on | default([]) | to_json }}
+    Properties:
+      Path: "{{ role_config.path | default('/') }}"
+      AssumeRolePolicyDocument:
+        Version: "{{ role_config.version | default('2012-10-17') }}"
+        Statement:
+{% for entity in role_config.trusted_entity %}
+        - Effect: "Allow"
+          Principal: {{ entity | to_json }}
+          Action: [ "sts:AssumeRole" ]
+{% endfor %}
+      Policies:
+{% for policy in role_config.policies %}
+      - PolicyName: "{{ policy.name }}"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+{% for statement in policy.statement %}
+          - Sid: "{{ statement.sid | default(policy.name) }}"
+            Effect: "{{ statement.effect | default('Allow') }}"
+            Action: {{ statement.action | to_json }}
+            Resource: {{ statement.resource | default('*') | to_json }}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{# SECTION 17 END - IAM #}
+{# SECTION 18 BEGIN - Cloudwatch Logs #}
+{% if stack.logs is defined %}
+{% if stack.logs.groups is defined %}
+  LogGroupsProvisionerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal: {"Service": "lambda.amazonaws.com"}
+          Action: [ "sts:AssumeRole" ]
+      Policies:
+      - PolicyName: "LogGroupsPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: "DescribeLogGroups"
+            Effect: "Allow"
+            Action: ["logs:DescribeLogGroups", "logs:DescribeSubscriptionFilters"]
+            Resource: { "Fn::Join": [":", [
+              "arn:aws:logs", {"Ref": "AWS::Region"}, {"Ref": "AWS::AccountId"}, "*" 
+            ] ] }
+          - Sid: "CreateLambdaLogs"
+            Effect: "Allow"
+            Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
+            Resource: {"Fn::Join": [":", ["arn:aws:logs", {"Ref": "AWS::Region"}, {"Ref": "AWS::AccountId"}, "log-group", "{{ '/aws/lambda/' + stack.name + '-cfnLogGroups' }}", "*", "*"]]}
+          - Sid: "ManageLogGroups"
+            Effect: "Allow"
+            Action: 
+            - "logs:CreateLogGroup"
+            - "logs:PutRetentionPolicy"
+            - "logs:PutSubscriptionFilter"
+            - "logs:DeleteLogGroup"
+            - "logs:DeleteRetentionPolicy"
+            - "logs:DeleteSubscriptionFilter"
+            Resource: { "Fn::Join": [":", [ 
+              "arn:aws:logs", { "Ref": "AWS::Region" }, { "Ref": "AWS::AccountId" }, 
+              "log-group", "{{ stack.name + '/*' }}"
+            ] ] }      
+  LogGroupsProvisioner:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "{{ stack.name + ' CloudWatch Log Groups Provisioner' }}"
+      Handler: "log_groups.handler"
+      MemorySize: 128
+      Runtime: "python2.7"
+      Timeout: 300
+      Role: { "Fn::GetAtt": [ "LogGroupsProvisionerRole", "Arn" ] }
+      FunctionName: "{{ stack.name + '-cfnLogGroups' }}"
+      Code:
+        S3Bucket: { "Fn::FindInMap": [ "LambdaS3Mappings", { "Ref" : "AWS::Region" }, { "Ref" : "AWS::AccountId" } ] }
+        S3Key: "cfnLogGroups.zip"
+{% if stack.logs.groups_version is defined %}
+        S3ObjectVersion: "{{ stack.logs.groups_version }}"
+{% endif %}
+{% for log_name, log_config in stack.logs.groups.items() %}
+{% if log_config.create | default(True) %}
+  {{ log_name }}:
+    Type: "Custom::LogGroup"
+{% if log_config.subscription is defined %}
+    DependsOn:
+      - "{{ log_config.subscription.DestinationArn.get("Fn::GetAtt")[0] + 'CollectorPermission' }}"
+{% endif %}
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["LogGroupsProvisioner", "Arn"] }
+      Name: "{{ log_config.name }}"
+      Retention: "{{ log_config.retention | default(30) }}"
+      Destroy: "{{ log_config.destroy | default('false') }}"
+{% if log_config.subscription is defined %}
+      Subscription: {{ log_config.subscription | to_json }}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if stack.logs.sources is defined %}
+  SumologicProvisionerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal: {"Service": "lambda.amazonaws.com"}
+          Action: [ "sts:AssumeRole" ]
+      Policies:
+      - PolicyName: "SumologicProvisionerPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: "DecryptCredentials"
+            Effect: "Allow"
+            Action: ["kms:Decrypt"]
+            Resource: { "Fn::Join": ["", [ 
+              "arn:aws:kms:",
+              { "Ref" : "AWS::Region" }, ":",{ "Ref" : "AWS::AccountId" }, ":key/",
+              { "Fn::FindInMap": [ "LambdaKMSMappings", { "Ref" : "AWS::Region" }, { "Ref" : "AWS::AccountId" } ] }
+            ] ] }
+          - Sid: "CreateLambdaLogs"
+            Effect: "Allow"
+            Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
+            Resource: { "Fn::Join": [":", [
+              "arn:aws:logs", {"Ref": "AWS::Region"}, {"Ref": "AWS::AccountId"}, "log-group", 
+              "{{ '/aws/lambda/' + stack.name + '-cfnSumologicProvisioner' }}", "*", "*"
+            ] ] }
+  SumologicProvisioner:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "{{ stack.name + ' Sumologic Source Provisioner' }}"
+      Handler: "sumologic_provisioner.handler"
+      MemorySize: 128
+      Runtime: "python2.7"
+      Timeout: 300
+      Role: { "Fn::GetAtt": [ "SumologicProvisionerRole", "Arn" ] }
+      FunctionName: "{{ stack.name + '-cfnSumologicProvisioner' }}"
+      Code:
+        S3Bucket: { "Fn::FindInMap": [ "LambdaS3Mappings", { "Ref" : "AWS::Region" }, { "Ref" : "AWS::AccountId" } ] }
+        S3Key: "cfnSumologicProvisioner.zip"
+{% if stack.logs.provisioner_version is defined %}
+        S3ObjectVersion: "{{ stack.logs.provisioner_version }}"
+{% endif %}
+{% for source_name, source_config in stack.logs.sources.items() %}
+{% if source_config.create | default(True) %}
+{% if source_config.type | default('sumologic') == 'sumologic' %}
+  {{ source_name + 'CollectorPermission'}}:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: { "Ref": "{{ source_name }}" }
+      Principal: { "Fn::Join": ["", ["logs.", { "Ref": "AWS::Region" }, ".amazonaws.com"] ] }
+      SourceAccount: { "Ref": "AWS::AccountId" }
+      SourceArn: { "Fn::Join": [":", [ 
+          "arn:aws:logs", { "Ref": "AWS::Region" }, { "Ref": "AWS::AccountId" }, 
+          "log-group", "{{ stack.name + '/*' }}"
+      ] ] }
+  {{ source_name + 'CollectorRole' }}:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal: {"Service": "lambda.amazonaws.com"}
+          Action: [ "sts:AssumeRole" ]
+      Policies:
+      - PolicyName: "SumologicCollectorPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: "GetConfig"
+            Effect: "Allow"
+            Action: ["dynamodb:GetItem"]
+            Resource: { "Fn::FindInMap": [ "LambdaConfigStoreMappings", { "Ref" : "AWS::Region" }, { "Ref" : "AWS::AccountId" } ] }
+          - Sid: "CreateLambdaLogs"
+            Effect: "Allow"
+            Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
+            Resource: { "Fn::Join": [":", [
+              "arn:aws:logs", {"Ref": "AWS::Region"}, {"Ref": "AWS::AccountId"}, "log-group", 
+              "{{ '/aws/lambda/' + stack.name + '-' + source_name }}", "*", "*"
+            ] ] }
+  {{ source_name }}:
+    Type: "AWS::Lambda::Function"
+    DependsOn:
+      - "{{ source_name + 'ConfigProvisioner' }}"
+    Properties:
+      Description: "{{ stack.name + '-' + source_name + ' Sumologic Collector' }}"
+      Handler: "sumologic_collector.handler"
+      MemorySize: 128
+      Runtime: "python2.7"
+      Timeout: 300
+      Role: { "Fn::GetAtt": [ "{{ source_name + 'CollectorRole' }}", "Arn" ] }
+      FunctionName: "{{ stack.name + '-' + source_name }}"
+      Code:
+        S3Bucket: { "Fn::FindInMap": [ "LambdaS3Mappings", { "Ref" : "AWS::Region" }, { "Ref" : "AWS::AccountId" } ] }
+        S3Key: "sumologicCollector.zip"
+{% if stack.logs.collector_version is defined %}
+        S3ObjectVersion: "{{ stack.logs.collector_version }}"
+{% endif %}
+  {{ source_name + 'ConfigProvisioner' }}:
+    Type: "Custom::DynamoDBProvisioner"
+    Properties:
+      ServiceToken: { "Fn::FindInMap": ["LambdaConfigProvisionerMappings", { "Ref" : "AWS::Region" }, { "Ref" : "AWS::AccountId" } ] }
+      PrimaryKey: FunctionName
+      TableName: CfnLambdaConfigStore
+      Item: 
+        FunctionName:
+          S: "{{ stack.name + '-' + source_name }}"
+        Value:
+          S: { "Fn::Join": ["\"", [ 
+            "{", "url", ":", { "Fn::GetAtt": [ "{{ source_name + 'Resource' }}", "Url" ] }, "}"
+          ] ] }
+  {{ source_name + 'Resource' }}:
+    Type: "Custom::SumoLogic"
+    Properties:
+      ServiceToken: { "Fn::GetAtt": ["SumologicProvisioner", "Arn"] }
+      Name: "{{ source_config.name }}"
+      Description: "{{ source_config.description | default(source_config.name) }}"
+      CollectorId: {{ source_config.collector_id | default(
+        { "Fn::FindInMap": [ "SumologicCollectorMappings", "collector", { "Ref": "AWS::AccountId" } ] }
+      ) | to_json }}
+      Credentials: "{{ source_config.credentials }}"
+      Category: "{{ source_config.category | default(stack.name) }}"
+      Hostname: "{{ source_config.hostname | default(stack.name) }}"
+      Timezone: "{{ source_config.timezone | default('Pacific/Auckland') }}"
+      SourceType: "{{ source_config.source_type | default('HTTP') }}"
+      MessagePerRequest: "{{ source_config.message_per_request | default('false') }}"
+{% endif %}  
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+{# SECTION 18 END - Cloudwatch Logs #}
+
+Mappings:
+  AmiMappings:
+    ap-southeast-2:
+      ecsBaseLogs: "ami-914676f2"
+  RdsPortMappings:
+    mysql:
+      port: "3306"
+    mariadb:
+      port: "3306"
+    postgres:
+      port: "5432"
+  CachePortMappings:
+    redis:
+      port: "6379"
+  AccountMappings:
+    sandbox:
+      id: "123456789012"
+  LambdaS3Mappings:
+    ap-southeast-2:
+      "123456789012": sandbox-jmenga-cfn-lambda
+  LambdaKMSMappings:
+    ap-southeast-2:
+      "123456789012": "ec2d993d-40c2-46b7-a8f4-6a3307d634cc"
+  LambdaConfigProvisionerMappings:
+    ap-southeast-2:
+      "123456789012": "arn:aws:lambda:ap-southeast-2:123456789012:function:lambdaConfigStoreProvisioner"
+  LambdaConfigStoreMappings:
+    ap-southeast-2:
+      "123456789012": "arn:aws:dynamodb:ap-southeast-2:146609405994:table/CfnLambdaConfigStore"

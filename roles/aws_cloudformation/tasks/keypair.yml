@@ -1,0 +1,17 @@
+---
+- block:  
+  - name: create key pair from public key
+    ec2_key:
+      name: "{{ stack.ec2_key_pair.name }}"
+      key_material: "{{ stack.ec2_key_pair.public_key }}"
+      state: present
+    when: stack.ec2_key_pair is defined and stack.ec2_key_pair.public_key is defined
+
+  - name: create key pair
+    ec2_key:
+      name: "{{ stack.ec2_key_pair.name }}"
+      state: present
+    when: stack.ec2_key_pair is defined and stack.ec2_key_pair.public_key is not defined
+    register: cf_ec2_key_pair
+  tags:
+    - deploy

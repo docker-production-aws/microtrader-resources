@@ -1,0 +1,25 @@
+---
+stack:
+  name: "{{ config_stack_name }}"
+  environment: "{{ config_environment }}"
+  region: "{{ config_region }}"
+  description: "{{ config_stack_description | default('Microtrader Resources - ' + config_environment) }}"
+  tags: {}
+
+  # S3 Bucket for Lambda
+  s3:
+    CfnLambdaBucket:
+      name: "{{ config_s3_name }}"
+      versioning_config:
+        Status: Enabled
+      tags:
+        - Key: Name
+          Value: "{{ config_s3_name }}"
+
+  outputs:
+    CfnLambdaBucket: 
+      description: "DNS name of CFN Lambda S3 Bucket"
+      value: { "Fn::GetAtt" : [ "CfnLambdaBucket", "DomainName" ] }
+    CfnLambdaBucketUrl: 
+      description: "Web URL of CFN Lambda S3 Bucket"
+      value: { "Fn::GetAtt" : [ "CfnLambdaBucket", "WebsiteURL" ] }

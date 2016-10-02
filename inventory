@@ -1,0 +1,8 @@
+[dev]
+dev ansible_connection=local
+
+[sandbox]
+sandbox ansible_connection=local
+
+[prod]
+prod ansible_connection=local

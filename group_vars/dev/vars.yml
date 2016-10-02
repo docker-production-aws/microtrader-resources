@@ -1,0 +1,6 @@
+config_stack_name: dev-microtrader-resources
+config_environment: dev
+config_region: ap-southeast-2
+
+# S3 settings
+config_s3_name: dev-dockerproductionaws-cfn-lambda

@@ -1,0 +1,8 @@
+---
+# dependencies:
+#   - role: aws_ip_ranges
+#     aws_ip_ranges_filter:
+#       service: AMAZON
+#       region: "{{ stack.region }}"
+#     tags:
+#       - always

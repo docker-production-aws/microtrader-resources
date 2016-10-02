@@ -1,0 +1,33 @@
+---
+- block:
+    - name: set template fact
+      set_fact:
+        cf_stack_template: "{{ stack.template | default('standard') }}"
+    - name: set template encoding facts
+      set_fact:
+        cf_stack_template_yaml: "{{ cf_build_folder }}/{{ cf_stack_template }}.yml"
+        cf_stack_template_json: "{{ cf_build_folder }}/{{ cf_stack_template }}.json"
+        cf_stack_template_temp_json: "{{ cf_build_folder }}/{{ cf_stack_template }}.tmp.json"
+        cf_stack_policy_json: "{{ cf_build_folder }}/policy.json"
+    - name: lookup aws ip ranges
+      set_fact: 
+        cf_aws_ip_ranges: "{{ lookup('aws_ranges', region=stack.region, service='AMAZON', wantlist=True) }}"
+    - name: generate YAML template
+      template:
+        src: "templates/{{ cf_stack_template }}.yml.j2"
+        dest: "{{ cf_stack_template_yaml }}"
+      changed_when: False
+    - name: generate stack policy
+      copy: content={{ stack.policy | default(cf_default_stack_policy) | to_json }} dest={{ cf_stack_policy_json }}
+      changed_when: False
+    - name: generate compact JSON template
+      copy: content={{ lookup('file', cf_stack_template_yaml) | from_yaml | to_json }} dest={{ cf_stack_template_temp_json }}
+      changed_when: False
+    - name: remove whitespace from compact JSON template
+      shell: cat {{ cf_stack_template_temp_json }} | jq -c '.' > {{ cf_stack_template_json }}
+      changed_when: False
+    - name: remove temp compact JSON template
+      file: path={{ cf_stack_template_temp_json }} state=absent
+      changed_when: False
+  tags:
+    - generate

@@ -1,0 +1,560 @@
+---
+stack:
+  name: dev-todobackend-web
+  environment: dev
+  region: ap-southeast-2
+  description: Todobackend Web Service Stack
+  tags:
+    Stack: dev-todobackend-web
+    Environment: development
+  template: standard
+  state: present
+  vpc_id: vpc-f9138b9c
+  ec2_key_pair: 
+    name: sandbox-default
+    public_key: "{{ lookup('file', '~/.ssh/aws_sandbox.pub') }}"
+
+  # Stack Inputs
+  inputs:
+    DbInstancePassword:
+      Type: "String"
+      NoEcho: "true"
+      Description: "The DB Instance Password"
+  input_mappings:
+    DbInstancePassword: "{{ db_password }}"
+
+  # Stack Outputs
+  outputs:
+    AppCluster: 
+      description: "ECS Cluster"
+      value: { "Ref": "EcsCluster" }
+    TodobackendAdhocSandboxTaskDef:
+      description: "Todobackend ECS Task Definition (ARN)"
+      value: { "Ref": "TodobackendSandboxTaskDef" }
+    TodobackendAdhocSandboxTaskDef: 
+      description: "Todobackend Adhoc ECS Task Definition (ARN)"
+      value: { "Ref": "TodobackendAdhocSandboxTaskDef" }
+    TodobackendService: 
+      description: "Todobackend Service (ARN)"
+      value: { "Ref": "TodobackendService" }
+    ElbDomainName:
+      description: "Public DNS name of ELB"
+      value: { "Fn::GetAtt": [ "ElasticLoadBalancer", "DNSName" ] }
+
+  # Elastic Load Balancing Settings
+  elb:
+    description: Todobackend ELB
+    scheme: internet-facing
+    subnet_ids:
+      - subnet-e2a0e387
+      - subnet-3b0e664c
+    health_check: "HTTP:8000/todos"
+    instances:
+      - { "Ref": "MyInstance" }
+    listeners: 
+      - protocol: tcp
+        front_end: 80
+        back_end: 8000
+        certificate_id: arn:iam:xxx:xxx
+        allowed_sources:
+          - 10.30.0.0/16
+
+  # DNS Settings
+  dns:
+    ns1.dev.aws.ytech.co.nz:
+      ttl: 300
+      ip: 172.21.4.4
+    ns2.dev.aws.ytech.co.nz:
+      ttl: 300
+      ip: 172.21.5.4
+      
+  # EC2 Settings
+  ec2:
+    security_groups:
+      MyCommonSG:
+        description: "My Test SG"
+        vpc_id: { "Ref": "VpcId" }
+        ingress_security_rules:
+          - protocol: tcp
+            port: 8000
+            permit:
+              - 0.0.0.0/0
+              - sg: { "Ref": "ElasticLoadBalancer" }
+              
+          - protocol: tcp
+            port: 8080
+            permit:
+              - 0.0.0.0/0
+        egress_security_rules: 
+          - protocol: tcp
+            port: 8080
+            permit:
+              - 0.0.0.0/0
+          - protocol: tcp
+            port: 8000
+            permit:
+              - 0.0.0.0/0
+              - sg: { "Ref": "ElasticLoadBalancer" }
+              - { "Ref": "Blah" }
+        tags: 
+          - { Key: "Test", Value: "Test" }
+    autoscaling:
+      SampleASG:
+        log_retention: 7
+        log_subscription:
+          FilterName: Default
+          FilterPattern: ""
+          DestinationArn: { "Fn::GetAtt": [ "SomeLogSource", "Arn" ] }
+        min_size: 0
+        max_size: 4
+        desired_size: 2
+        subnet_ids:
+          - subnet-a7336fc2
+          - subnet-0aa6dc7d
+        instance_type: "t2.micro"
+        associate_public_ip: "true"
+        key_name: sandbox-default
+        ami: ami-75a38416
+        ecs_cluster: { "Ref": "EcsCluster" }
+        # load_balancers: 
+        #   - { "Ref": "ElasticLoadBalancer" }
+        ingress_security_rules:
+        - protocol: tcp
+          port: 8000
+          permit:
+            - sg: { "Ref": "ElasticLoadBalancer" }
+        managed_policies:
+          - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+        inline_policies:
+          - {
+              "PolicyName": "S3Bucket",
+              "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "s3:ListBucket",
+                      "s3:GetBucketLocation"
+                    ],
+                    "Resource": [ { "Fn::Join" : ["", [ "arn:aws:s3:::", { "Ref" : "ConfigBucket" } ] ] } ]
+                  },
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "s3:GetObject"
+                    ],
+                    "Resource": [ { "Fn::Join" : ["", [ "arn:aws:s3:::", { "Ref" : "ConfigBucket" }, "/*" ] ] } ]
+                  }
+                ]
+              } 
+            }
+    instances:
+      PowerdnsA:
+        ami: ami-75a38416
+        instance_type: "t2.micro"
+        key_name: sandbox-default
+        private_ip_address: 172.21.4.4
+        subnet_id: subnet-f3a6dc84
+        monitoring: "true"
+        userdata:
+          - echo 'supersede domain-name-servers 172.21.0.2;' >> /etc/dhcp/dhclient.conf\n
+          - echo 'nameserver 172.21.0.2' > /etc/resolv.conf
+      PowerdnsB:
+        ami: ami-75a38416
+        instance_type: "t2.micro"
+        key_name: sandbox-default
+        private_ip_address: 172.21.5.4
+        subnet_id: subnet-d8336fbd
+        monitoring: "true"
+        userdata:
+          - echo 'supersede domain-name-servers 172.21.0.2;' >> /etc/dhcp/dhclient.conf\n
+          - echo 'nameserver 172.21.0.2' > /etc/resolv.conf
+  ecs:
+    clusters:
+      EcsCluster: {}
+    services:
+      Todobackend: 
+        cluster: { "Ref": "EcsCluster" }
+        task_definition: { "Ref": "TodobackendSandboxTaskDef" }
+        desired_count: 2
+        load_balancer: 
+          name: { "Ref": "ElasticLoadBalancer" }
+          # role: Specify custom role here
+          container_name: nginx
+          container_port: 8000
+        deployment_config:
+          minimumHealthyPercent: 50
+          maximumPercent: 200
+        wait: True    
+    tasks:
+      migrate:
+        cluster: { "Ref": "EcsCluster" }
+        operation: run
+        order: 1
+        wait: True
+        task_definition: { "Ref": "TodobackendAdhocSandboxTaskDef" }
+        on_create: True
+        count: 1
+        started_by: admin
+        overrides:
+          containerOverrides:
+          - name: todobackend
+            command:
+            - manage.py
+            - migrate
+            - "--noinput"
+      collectstatic: 
+        cluster: { "Ref": "EcsCluster" }
+        operation: run
+        order: 2
+        wait: True
+        task_definition: { "Ref": "TodobackendAdhocSandboxTaskDef" }
+        count: 2
+        started_by: admin
+        overrides:
+          containerOverrides:
+          - name: todobackend
+            command:
+            - manage.py
+            - collectstatic
+            - "--noinput"
+    task_definitions:
+      TodobackendSandboxTaskDef:
+        containers:
+        - Name: nginx
+          Image: nginx:latest
+          Memory: 995
+          PortMappings:
+          - ContainerPort: 8000
+            HostPort: 8000
+          MountPoints:
+          - ContainerPath: /var/www/todobackend
+            SourceVolume: webroot
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: { "Ref": "ApplicationNginxLogGroup" }
+              awslogs-region: ap-southeast-2
+        - Name: todobackend
+          Image: yellownz/todobackend:latest
+          Memory: 995
+          MountPoints:
+          - ContainerPath: /var/www/todobackend
+            SourceVolume: webroot
+          Environment:
+          - Name: DJANGO_SETTINGS_MODULE
+            Value: todobackend.settings.release
+          - Name: MYSQL_HOST
+            Value: { "Fn::GetAtt": [ "TodobackendDb", "Endpoint.Address"] }
+          - Name: MYSQL_USER
+            Value: todobackend
+          - Name: CREDENTIAL_STORE
+            Value: dev-todobackend
+          Command:
+          - uwsgi
+          - "--socket /var/www/todobackend/todobackend.sock"
+          - "--chmod-socket=666"
+          - "--module todobackend.wsgi"
+          - "--master"
+          - "--static-map /static=/var/www/todobackend/static"
+          - "--die-on-term"
+        volumes:
+        - Name: webroot
+          Host: 
+            SourcePath: "/ecs/webroot"
+      TodobackendAdhocSandboxTaskDef:
+        containers:
+        - Name: todobackend
+          Image: yellownz/todobackend:latest
+          Memory: 400
+          MountPoints:
+          - ContainerPath: /var/www/todobackend
+            SourceVolume: webroot
+          Environment:
+          - Name: DJANGO_SETTINGS_MODULE
+            Value: todobackend.settings.release
+          - Name: MYSQL_HOST
+            Value: { "Fn::GetAtt": [ "TodobackendDb", "Endpoint.Address"] }
+          - Name: MYSQL_USER
+            Value: todobackend
+          - Name: CREDENTIAL_STORE
+            Value: dev-todobackend
+        volumes:
+        - Name: webroot
+          Host: 
+            SourcePath: "/ecs/webroot"
+
+  # Database Settings
+  db:
+    MyDbInstance:
+      engine: MySQL
+      engine_version: 5.6
+      allocated_storage: 30
+      storage_type: gp2
+      instance_class: db.t2.micro
+      username: todobackend
+      password: "{{ MYSQL_PASSWORD_SECRET }}"
+      subnet_ids:
+        - subnet-f2a0e397
+        - subnet-140e6663
+      ingress_security_rules:
+        - protocol: tcp
+          port: 3306
+          permit:
+            - 172.16.0.0/16
+            - sg: { "Ref": "SampleASG" }
+            - { "Ref": "SomeOtherRef" }
+
+  # Credential Store Settings
+  credential_store:
+    name: dev-todobackend
+    key_admins: 
+      - arn:aws:iam::706286425777:role/admin
+    key_operators: 
+      - arn:aws:iam::706286425777:role/admin
+     key_users:
+      - iam: { "Ref": "TodobackendASG" }
+    # key_id: a7aed769-52ed-44d8-9349-bfe5bae46028
+    credentials:
+      MYSQL_PASSWORD: "{{ db_password }}"
+
+  # Elasticsearch Service
+  elasticsearch:
+    Elasticsearch:
+      name: "{{ env + '-todobackend' }}"
+      instance_count: 2
+      instance_type: t2.small.elasticsearch
+      zone_aware: true
+      ebs:
+        volume_size: 20
+        volume_type: gp2
+      access_policies:
+        readwrite_users:
+          - iam: ApplicationAutoscaling
+        readonly_ips:
+          - 123.45.67.89/32
+      custom_policies:
+        - Action: "es:ESHttpPost"
+          Effect: "Allow"
+          Principal:
+            - iam: ApplicationAutoscaling
+          Resource: 
+            - { "Fn::Join": ["", [  
+                "arn:aws:es:", { "Ref": "AWS::Region" }, ":", { "Ref": "AWS::AccountId" }, 
+                ":domain/", "{{ elasticsearch_domain }}", "/myindex/_suggest"
+              ] ] }
+        - Action: "es:ESHttpGet"
+          Effect: "Allow"
+          SourceIp:
+            - 172.31.0.0/16
+          Resource:
+            - { "Fn::Join": ["", [
+                "arn:aws:es:", { "Ref": "AWS::Region" }, ":", { "Ref": "AWS::AccountId" },
+                ":domain/", "{{ elasticsearch_domain }}", "/myindex/mydoctype"
+              ] ] }
+      tags:
+        - Key: Name
+          Value: "{{ env + '-todobackend-Elasticsearch' }}"
+
+  # S3 buckets
+  s3:
+    OriginBucket:
+      name: "{{ env + '-todobackend-origin-bucket' }}"
+      policy:
+        readwrite_users:
+          - iam: SampleASG
+        readonly_users:
+          - "*"
+      tags:
+        - Key: Name
+          Value: "{{ env + '-todobackend-OriginBucket' }}"
+    LogBucket:
+      name: "{{ env + '-todobackend-log-bucket' }}"
+      tags:
+        - Key: Name
+          Value: "{{ env + '-todobackend-LogBucket' }}"
+
+  # CloudFront distributions
+  cloudfront:
+    TestDistro:
+      create: True
+      aliases:
+        - todobackend.yellow.co.nz
+      cache_behaviors:
+        - PathPattern: static/*
+          ForwardedValues:
+            QueryString: False
+          TargetOriginId: Bucket
+          ViewerProtocolPolicy: allow-all
+          MinTTL: 30
+          MaxTTL: 60
+          DefaultTTL: 30
+      default_cache_behavior:
+        ForwardedValues:
+          QueryString: False
+        TargetOriginId: Elb
+        ViewerProtocolPolicy: allow-all
+        MinTTL: 0
+        MaxTTL: 0
+        DefaultTTL: 0
+      default_root: index.php
+      logging:
+        Bucket: { "Fn::GetAtt" : [ "LogBucket", "DomainName" ] }
+        Prefix: logs/
+      s3_origins:
+        Bucket:
+          domain_name: { "Fn::GetAtt" : [ "OriginBucket", "DomainName" ] }
+      custom_origins:
+        Elb:
+          domain_name: { "Fn::GetAtt" : [ "ElasticLoadBalancer", "DNSName" ] }
+          protocol_policy: http-only
+      viewer_certificate:
+        # IamCertificateId is the actual ID rather than the ARN, e.g. ASCA1234ABCDEFGHIJKLMN
+        IamCertificateId: "{{ todobackend_public_certificate_iam_id }}"
+        MinimumProtocolVersion: TLSv1
+        SslSupportMethod: sni-only
+      web_acl_id: { "Ref" : "ApplicationAcl" }
+
+  # WAF ACLs, rules, and conditions
+  waf:
+    create: True
+    acls:
+      ApplicationAcl:
+        default_action: BLOCK
+        rules:
+          - id: { "Ref" : "CustomHeaderRule" }
+            priority: 1
+            action: BLOCK
+          - id: { "Ref" : "QueryStringRule" }
+            priority: 2
+            action: BLOCK
+          - id: { "Ref" : "SqlInjectionRule" }
+            priority: 3
+            action: BLOCK
+          - id: { "Ref" : "XssRule" }
+            priority: 4
+            action: BLOCK
+          - id: { "Ref" : "IpBlockRule" }
+            priority: 5
+            action: ALLOW
+    rules:
+      CustomHeaderRule:
+        predicates:
+          - string_match: { "Ref" : "CustomHeader" }
+            negated: True
+      QueryStringRule:
+        predicates:
+          - size_constraint: { "Ref" : "QueryStringLength" }
+      SqlInjectionRule:
+        predicates:
+          - sql_injection_match: { "Ref" : "SqlInjection" }
+      XssRule:
+        predicates:
+          - xss_match: { "Ref" : "Xss" }
+      IpBlockRule:
+        predicates:
+          - ip_match: { "Ref" : "YpgInternet" }
+    string_match:
+      CustomHeader:
+        tuples:
+          - FieldToMatch:
+              Type: HEADER
+              Data: X-Secret-Auth
+            PositionalConstraint: EXACTLY
+            TargetString: apikey123
+            TextTransformation: NONE
+    size_constraint:
+      QueryStringLength:
+        constraints:
+          - ComparisonOperator: GT
+            FieldToMatch:
+              Type: QUERY_STRING
+            Size: 30
+            TextTransformation: URL_DECODE
+    sql_injection_match:
+      SqlInjection:
+        tuples:
+          - FieldToMatch:
+              Type: QUERY_STRING
+            TextTransformation: HTML_ENTITY_DECODE
+          - FieldToMatch:
+              Type: QUERY_STRING
+            TextTransformation: URL_DECODE
+    xss_match:
+      Xss:
+        tuples:
+          - FieldToMatch:
+              Type: QUERY_STRING
+            TextTransformation: HTML_ENTITY_DECODE
+          - FieldToMatch:
+              Type: QUERY_STRING
+            TextTransformation: URL_DECODE
+    ip_match:
+      YpgInternet:
+        cidr_ranges:
+          - 122.56.5.186/32
+          - 103.250.48.20/32
+
+  # Cloudwatch Alarms
+  cloudwatch:
+    alarms:
+      topic: MyStackTopic
+      subscriptions:
+        - protocol: https
+          endpoint: https://events.pagerduty.com/integration/abcd123456/enqueue
+  
+  # Cloudwatch Logs
+  logs:
+    sources:
+      ECSLogSource:
+        create: "{{ create_param | default(True) }}"
+        name: my-stack/ECS
+        description: My Stack ECS Logs
+        collector_id: 10034853
+        credentials: my-encrypted-credentials
+        category: my-stack
+        hostname: { "Ref": "ApplicationNginxLogGroup" }
+    groups:
+      ApplicationNginxLogGroup:
+        create: "{{ create_param | default(False) }}"
+        name: my-stack/ECS/ApplicationCluster/ApplicationService/nginx
+        retention: 7
+        destroy: true     # Destroys log group on resource deletion         
+      ApplicationRegistryLogGroup:
+        name: my-stack/ECS/ApplicationCluster/ApplicationService/registry
+        retention: 30
+        subscription:
+          FilterName: Errors and exceptions
+          FilterPattern: ERROR Exception
+          DestinationArn: { "Fn::GetAtt": [ "ECSLogSource", "Arn" ] }
+
+  # IAM Roles
+  iam:
+    roles:
+      AcmCloudfrontIAMRole:
+        create: "{{ hydrogen_cloudfront_create | default(False) }}"
+        trusted_entity:
+          - Service: "lambda.amazonaws.com"
+        policies:
+          - name: CloudfrontPolicy
+            statement:
+              - action:
+                - cloudfront:GetDistributionConfig
+                - cloudfront:UpdateDistribution
+          - name: ACMPolicy
+            statement:
+              - action:
+                  - "acm:GetCertificate"
+                resource: "{{ hydrogen_cloudfront_acm_arn }}"
+          - name: LambdaLogs
+            statement:
+              - action:
+                - "logs:CreateLogGroup"
+                - "logs:CreateLogStream"
+                - "logs:PutLogEvents"
+                - "logs:DescribeLogStreams"
+                resource: { "Fn::Join": ["", [ 
+                  "arn:aws:logs:", { "Ref": "AWS::Region" }, ":", { "Ref": "AWS::AccountId" }, 
+                  "{{ ':log-group:/aws/lambda/' + hydrogen_acm_cf_lambda_function }}", "*"
+                ] ] }

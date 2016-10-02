@@ -1,0 +1,38 @@
+---
+- block:
+    - name: set local path fact if s3 upload disabled
+      set_fact:
+        cf_stack_template_path: "{{ cf_stack_template_json }}"
+      when: not cf_upload_s3 | default(True) | bool
+    - name: configure application stack
+      cloudformation:
+        stack_name: "{{ stack.name }}"
+        stack_policy: "{{ cf_stack_policy_json }}"
+        state: present
+        template: "{{ cf_stack_template_path | default(omit) }}"
+        template_url: "{{ cf_s3_template_url | default(omit) }}"
+        template_parameters: "{{ stack.input_mappings | default({}) }}"
+        tags: "{{ stack.tags|default({}) }}"
+      register: cf_stack_result
+  tags:
+    - deploy
+
+- block:
+    - name: get stack facts
+      cloudformation_facts:
+        stack_name: "{{ stack.name }}"
+        stack_resources: true
+      changed_when: false
+      register: cf_stack_facts
+    - name: set stack outputs and resources 
+      set_fact:
+        cf_stack_outputs: "{{ cf_stack_facts.get('stack_outputs') }}"
+        cf_stack_resources: "{{ cf_stack_facts.get('stack_resources') }}"
+    - debug: msg={{ cf_stack_facts }}
+      when: debug is defined
+    - debug: msg={{ cf_stack_outputs }}
+      when: debug is defined
+    - debug: msg={{ cf_stack_resources }}
+      when: debug is defined
+  tags:
+    - deploy
